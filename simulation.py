@@ -1,12 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Sequence, Tuple
 
 import networkx as nx
 import numpy as np
+import pandas as pd
 
 from geo import haversine_km
+from policies import (
+    AdaptiveDefenderPolicy,
+    StrategicAttackerPolicy,
+    predict_fraud_and_uncertainty,
+    summarize_defender_metrics,
+)
 
 Coordinate = Tuple[float, float]
 
@@ -75,6 +82,14 @@ SYBIL_LATENCY_NOISE_STD = 3.0
 REGIONAL_ATTACK_LATENCY_FACTOR = 0.85
 MAX_SYBIL_ATTACKER_RATIO = 0.98
 SYBIL_ATTACKER_RATIO_BOOST = 0.25
+IDENTITY_RESET_HIGH_SCORE_FACTOR = 1.15
+IDENTITY_RESET_LOW_REWARD_THRESHOLD = 0.55
+IDENTITY_RESET_COOLDOWN_TIMESTEPS = 2
+NO_RESET_SENTINEL = -999
+HIGH_PROFIT_EXPLOIT_THRESHOLD = 2.2
+DEFENSIVE_UNCERTAINTY_THRESHOLD = 0.45
+DETECTED_ATTACKER_REWARD = 0.55
+UNDETECTED_ATTACKER_REWARD = 2.4
 
 
 @dataclass(frozen=True)
@@ -98,6 +113,7 @@ class TimeStepSnapshot:
     latency_matrix: np.ndarray
     peer_graph: nx.DiGraph
     fraud_scores: Dict[int, float]
+    uncertainty_scores: Dict[int, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -114,6 +130,7 @@ class SimulationResult:
     peer_graph: nx.DiGraph
     time_steps: List[TimeStepSnapshot]
     fraud_scores_over_time: List[Dict[int, float]]
+    uncertainty_over_time: List[Dict[int, float]]
     scenario_events: List[AttackScenarioEvent]
     scenario_metrics: Dict[str, float]
 
@@ -304,7 +321,15 @@ def _initialize_smart_states(
                 "reduce_clustering": 0,
                 "add_noise": 0,
                 "increase_connections": 0,
+                "noop": 0,
             },
+            "cumulative_reward": 0.0,
+            "reward_history": [],
+            "public_node_id": f"node-{node.node_id}",
+            "identity_reset_count": 0,
+            "last_identity_reset_timestep": NO_RESET_SENTINEL,
+            "post_reset_detections": 0,
+            "detected_since_reset": False,
         }
     return states
 
@@ -558,6 +583,7 @@ def _build_peer_graph(
     rng: np.random.Generator,
     smart_states: Dict[int, Dict[str, object]],
     scenario_state: Dict[str, Any],
+    quarantined_nodes: set[int] | None = None,
 ) -> nx.DiGraph:
     graph = nx.DiGraph()
     labels = np.array([n.label for n in nodes], dtype=object)
@@ -567,6 +593,7 @@ def _build_peer_graph(
     honest_ids = np.where(labels == "honest")[0]
     sybil_nodes = set(int(x) for x in scenario_state.get("sybil_swarm_nodes", set()))
     corrupted_honest = set(int(x) for x in scenario_state.get("corrupted_honest_nodes", set()))
+    quarantined_nodes = quarantined_nodes or set()
 
     for node in nodes:
         graph.add_node(
@@ -584,7 +611,11 @@ def _build_peer_graph(
 
     for node in nodes:
         i = node.node_id
+        if i in quarantined_nodes:
+            continue
         base_candidates = np.delete(all_ids, i)
+        if quarantined_nodes:
+            base_candidates = np.array([c for c in base_candidates if int(c) not in quarantined_nodes], dtype=int)
 
         if node.label == "honest" and i not in corrupted_honest:
             k = int(rng.integers(7, 15))
@@ -675,7 +706,7 @@ def _score_snapshot_for_adaptation(
     timestep: int,
     model: object,
     feature_columns: Sequence[str],
-) -> Dict[int, float]:
+) -> tuple[Dict[int, float], Dict[int, float], pd.DataFrame]:
     from features import build_model_features_from_temporal_frame, extract_snapshot_features
 
     nodes_meta = {
@@ -693,13 +724,20 @@ def _score_snapshot_for_adaptation(
     )
     model_df = build_model_features_from_temporal_frame(snapshot_df)
     X = model_df[list(feature_columns)]
-    scores = model.predict_proba(X)[:, 1]
-    return {int(node_id): float(score) for node_id, score in zip(model_df["node_id"], scores)}
+    scores, uncertainty = predict_fraud_and_uncertainty(model, X)
+    score_map = {int(node_id): float(score) for node_id, score in zip(model_df["node_id"], scores)}
+    uncertainty_map = {int(node_id): float(u) for node_id, u in zip(model_df["node_id"], uncertainty)}
+    return score_map, uncertainty_map, model_df
 
 
 def _update_smart_attacker_states(
     smart_states: Dict[int, Dict[str, object]],
     fraud_scores: Dict[int, float],
+    uncertainty_scores: Dict[int, float],
+    model_df: pd.DataFrame,
+    model_for_adaptation: object,
+    feature_columns: Sequence[str],
+    attacker_policy: StrategicAttackerPolicy,
     threshold: float,
     timestep: int,
     total_timesteps: int,
@@ -707,12 +745,14 @@ def _update_smart_attacker_states(
     adaptation_growth: float,
     rng: np.random.Generator,
 ) -> None:
+    feature_rows = {int(row["node_id"]): row for _, row in model_df.iterrows()}
     for node_id, state in smart_states.items():
         strategy = str(state.get("strategy", "low_and_slow"))
         adaptation_strength = adaptation_base + adaptation_growth * (
             timestep / max(1, total_timesteps - 1)
         )
         score = float(fraud_scores.get(node_id, 0.0))
+        uncertainty = float(uncertainty_scores.get(node_id, 0.0))
         state["fraud_score"] = score
         state["adaptation_strength"] = adaptation_strength
 
@@ -724,31 +764,64 @@ def _update_smart_attacker_states(
         budget = min(max_budget, float(state.get("stealth_budget", max_budget)) + regen)
         state["stealth_budget"] = budget
         state["last_targeted_feature"] = ""
-
-        if score >= threshold and budget > 0.0:
-            priorities = list(state.get("feature_priority", list(DEFAULT_TARGET_FEATURE_PRIORITY)))
-            for feature_name in priorities:
-                action = FEATURE_TARGET_ACTIONS.get(str(feature_name))
-                if action is None:
-                    continue
-                cost = float(STEALTH_ACTION_COSTS[action])
-                if budget < cost:
-                    continue
-                _apply_targeted_action(state=state, action=action, adaptation_strength=adaptation_strength, rng=rng)
-                budget -= cost
+        rewards = [float(v) for v in state.get("reward_history", [])]
+        recent_profit = float(np.mean(rewards[-3:])) if rewards else 0.0
+        node_row = feature_rows.get(node_id)
+        selected_action = "noop"
+        if node_row is not None and model_for_adaptation is not None and feature_columns:
+            decision = attacker_policy.decide_action(
+                feature_row=node_row,
+                feature_columns=feature_columns,
+                model_bundle=model_for_adaptation,
+                current_score=score,
+                threshold=threshold,
+                recent_profit=recent_profit,
+            )
+            selected_action = decision.action
+            action_cost = float(STEALTH_ACTION_COSTS.get(selected_action, 0.0))
+            if action_cost <= budget and selected_action != "noop":
+                _apply_targeted_action(state=state, action=selected_action, adaptation_strength=adaptation_strength, rng=rng)
+                budget -= action_cost
                 state["stealth_budget"] = budget
-                state["last_targeted_feature"] = str(feature_name)
-                action_counts = dict(state.get("target_action_counts", {}))
-                action_counts[action] = int(action_counts.get(action, 0)) + 1
-                state["target_action_counts"] = action_counts
+                state["last_targeted_feature"] = selected_action
                 state["exploit_pressure"] = max(0.0, float(state["exploit_pressure"]) - 0.10 * adaptation_strength)
-                break
-        else:
+            else:
+                selected_action = "noop"
+        if selected_action == "noop":
             state["clustering_bias"] = min(1.0, float(state["clustering_bias"]) + 0.08 * adaptation_strength)
             state["latency_noise_scale"] = max(0.0, float(state["latency_noise_scale"]) - 0.05 * adaptation_strength)
             state["honest_connection_bias"] = max(0.0, float(state["honest_connection_bias"]) - 0.07 * adaptation_strength)
             state["randomization"] = max(0.0, float(state["randomization"]) - 0.05 * adaptation_strength)
             state["exploit_pressure"] = min(1.0, float(state["exploit_pressure"]) + 0.12 * adaptation_strength)
+        action_counts = dict(state.get("target_action_counts", {}))
+        action_counts[selected_action] = int(action_counts.get(selected_action, 0)) + 1
+        state["target_action_counts"] = action_counts
+
+        if recent_profit >= HIGH_PROFIT_EXPLOIT_THRESHOLD:
+            state["exploit_pressure"] = min(1.0, float(state["exploit_pressure"]) + 0.10)
+        if score >= threshold or uncertainty >= DEFENSIVE_UNCERTAINTY_THRESHOLD:
+            state["latency_noise_scale"] = min(3.0, float(state["latency_noise_scale"]) + 0.08)
+            state["clustering_bias"] = max(0.02, float(state["clustering_bias"]) - 0.05)
+
+        last_reset = int(state.get("last_identity_reset_timestep", NO_RESET_SENTINEL))
+        reset_trigger = (
+            score >= threshold * IDENTITY_RESET_HIGH_SCORE_FACTOR
+            or recent_profit <= IDENTITY_RESET_LOW_REWARD_THRESHOLD
+        )
+        if reset_trigger and (timestep - last_reset) >= IDENTITY_RESET_COOLDOWN_TIMESTEPS:
+            reset_count = int(state.get("identity_reset_count", 0)) + 1
+            state["identity_reset_count"] = reset_count
+            state["public_node_id"] = f"node-{node_id}-reset-{reset_count}"
+            state["last_identity_reset_timestep"] = timestep
+            state["detected_since_reset"] = score >= threshold
+            state["stealth_budget"] = max_budget
+            state["exploit_pressure"] = max(0.0, float(state["exploit_pressure"]) - 0.25)
+            state["honest_connection_bias"] = min(1.0, float(state["honest_connection_bias"]) + 0.20)
+            state["randomization"] = min(1.0, float(state["randomization"]) + 0.12)
+        else:
+            has_reset_before = int(state.get("last_identity_reset_timestep", NO_RESET_SENTINEL)) != NO_RESET_SENTINEL
+            if has_reset_before and score >= threshold:
+                state["post_reset_detections"] = int(state.get("post_reset_detections", 0)) + 1
 
         if strategy == "low_and_slow":
             state["exploit_pressure"] = min(float(state["exploit_pressure"]), 0.45)
@@ -757,6 +830,25 @@ def _update_smart_attacker_states(
             state["honest_connection_bias"] = max(float(state["honest_connection_bias"]), 0.55)
         elif strategy == "burst_attack" and bool(state["burst_active"]) and score < threshold:
             state["exploit_pressure"] = min(1.0, float(state["exploit_pressure"]) + 0.25 + float(rng.uniform(0.0, 0.2)))
+
+
+def _update_attacker_economic_feedback(
+    smart_states: Dict[int, Dict[str, object]],
+    fraud_scores: Dict[int, float],
+    threshold: float,
+) -> None:
+    for node_id, state in smart_states.items():
+        detected = float(fraud_scores.get(node_id, 0.0)) >= threshold
+        reward = DETECTED_ATTACKER_REWARD if detected else UNDETECTED_ATTACKER_REWARD
+        reward_history = list(state.get("reward_history", []))
+        reward_history.append(float(reward))
+        state["reward_history"] = reward_history[-24:]
+        state["cumulative_reward"] = float(state.get("cumulative_reward", 0.0)) + float(reward)
+        if reward >= (UNDETECTED_ATTACKER_REWARD - 0.3):
+            state["exploit_pressure"] = min(1.0, float(state.get("exploit_pressure", 0.3)) + 0.06)
+        if detected:
+            state["latency_noise_scale"] = min(3.0, float(state.get("latency_noise_scale", 0.3)) + 0.10)
+            state["honest_connection_bias"] = min(1.0, float(state.get("honest_connection_bias", 0.2)) + 0.08)
 
 
 def build_network_simulation(
@@ -782,6 +874,8 @@ def build_network_simulation(
     smart_strategy_mix: Dict[str, float] | None = None,
     smart_target_top_k: int = 3,
     enable_system_attacks: bool = True,
+    defender_retrain_interval: int = 4,
+    defender_window_size: int = 6,
 ) -> SimulationResult:
     if total_nodes < 10:
         raise ValueError("total_nodes must be at least 10 for a meaningful topology")
@@ -835,6 +929,15 @@ def build_network_simulation(
     feature_columns = tuple(feature_columns or [])
     feature_priority = _derive_feature_priority(model_for_adaptation, feature_columns, top_k=smart_target_top_k)
     smart_states = _initialize_smart_states(nodes, total_timesteps=time_steps, rng=rng, feature_priority=feature_priority)
+    attacker_policy = StrategicAttackerPolicy()
+    defender_policy = AdaptiveDefenderPolicy(
+        base_threshold=fraud_score_threshold,
+        retrain_interval=defender_retrain_interval,
+        sliding_window_steps=defender_window_size,
+        dynamic_threshold=True,
+        quarantine_duration=2,
+    )
+    defender_policy.register_nodes([node.node_id for node in nodes])
     scenario_state: Dict[str, Any] = {
         "high_value_region": high_value_region,
         "regional_attack_active": False,
@@ -845,11 +948,13 @@ def build_network_simulation(
 
     snapshots: List[TimeStepSnapshot] = []
     fraud_scores_over_time: List[Dict[int, float]] = []
+    uncertainty_over_time: List[Dict[int, float]] = []
     scenario_events: List[AttackScenarioEvent] = []
 
     for timestep in range(time_steps):
         if enable_system_attacks:
             scenario_events.extend(_activate_attack_scenarios(timestep=timestep, nodes=nodes, scenario_state=scenario_state, rng=rng))
+        quarantined_nodes = {node_id for node_id in smart_states if defender_policy.is_quarantined(node_id, timestep)}
         latency_matrix = _build_latency_matrix(
             nodes=nodes,
             timestep=timestep,
@@ -870,11 +975,14 @@ def build_network_simulation(
             rng=rng,
             smart_states=smart_states,
             scenario_state=scenario_state,
+            quarantined_nodes=quarantined_nodes,
         )
 
         fraud_scores: Dict[int, float] = {}
+        uncertainty_scores: Dict[int, float] = {}
+        model_df = pd.DataFrame()
         if model_for_adaptation is not None and feature_columns:
-            fraud_scores = _score_snapshot_for_adaptation(
+            fraud_scores, uncertainty_scores, model_df = _score_snapshot_for_adaptation(
                 nodes=nodes,
                 latency_matrix=latency_matrix,
                 graph=peer_graph,
@@ -882,7 +990,39 @@ def build_network_simulation(
                 model=model_for_adaptation,
                 feature_columns=feature_columns,
             )
+            node_region_map = {node.node_id: node.region for node in nodes}
+            node_label_map = {node.node_id: node.label for node in nodes}
+            effective_pred = []
+            y_true = []
+            for node_id, score in fraud_scores.items():
+                uncertainty = float(uncertainty_scores.get(node_id, 0.0))
+                label = node_label_map.get(node_id, "honest")
+                region = node_region_map.get(node_id, "unknown")
+                flagged = defender_policy.assess_node(
+                    node_id=node_id,
+                    label=label,
+                    region=region,
+                    fraud_score=float(score),
+                    uncertainty=uncertainty,
+                    timestep=timestep,
+                )
+                y_true.append(0 if label == "honest" else 1)
+                effective_pred.append(1 if flagged else 0)
+            defender_policy.training_history.append(model_df.copy())
+            defender_policy.timestep_metrics(
+                y_true=np.array(y_true, dtype=int),
+                y_pred=np.array(effective_pred, dtype=int),
+                threshold=defender_policy.current_threshold,
+            )
+            retrained_bundle = defender_policy.maybe_retrain(
+                timestep=timestep,
+                feature_columns=feature_columns,
+                random_state=seed,
+            )
+            if retrained_bundle is not None:
+                model_for_adaptation = retrained_bundle
         fraud_scores_over_time.append(fraud_scores)
+        uncertainty_over_time.append(uncertainty_scores)
 
         snapshots.append(
             TimeStepSnapshot(
@@ -890,14 +1030,25 @@ def build_network_simulation(
                 latency_matrix=latency_matrix,
                 peer_graph=peer_graph,
                 fraud_scores=fraud_scores,
+                uncertainty_scores=uncertainty_scores,
             )
+        )
+        _update_attacker_economic_feedback(
+            smart_states=smart_states,
+            fraud_scores=fraud_scores,
+            threshold=defender_policy.current_threshold,
         )
 
         if smart_states and timestep < time_steps - 1:
             _update_smart_attacker_states(
                 smart_states=smart_states,
                 fraud_scores=fraud_scores,
-                threshold=fraud_score_threshold,
+                uncertainty_scores=uncertainty_scores,
+                model_df=model_df,
+                model_for_adaptation=model_for_adaptation if model_for_adaptation is not None else {},
+                feature_columns=feature_columns,
+                attacker_policy=attacker_policy,
+                threshold=defender_policy.current_threshold,
                 timestep=timestep,
                 total_timesteps=time_steps,
                 adaptation_base=adaptation_base,
@@ -916,14 +1067,25 @@ def build_network_simulation(
         event_counts[key] = float(event_counts.get(key, 0.0) + 1.0)
     if smart_states:
         avg_remaining_budget = float(np.mean([float(state.get("stealth_budget", 0.0)) for state in smart_states.values()]))
+        total_resets = int(sum(int(state.get("identity_reset_count", 0)) for state in smart_states.values()))
+        total_post_reset_detections = int(sum(int(state.get("post_reset_detections", 0)) for state in smart_states.values()))
+        avg_reward = float(np.mean([float(state.get("cumulative_reward", 0.0)) for state in smart_states.values()]))
     else:
         avg_remaining_budget = 0.0
+        total_resets = 0
+        total_post_reset_detections = 0
+        avg_reward = 0.0
+    defender_summary = summarize_defender_metrics(defender_policy, current_timestep=time_steps - 1)
     scenario_metrics: Dict[str, float] = {
         **event_counts,
+        **defender_summary,
         "scenario_event_count": float(len(scenario_events)),
         "high_value_region_node_count": float(sum(1 for n in nodes if n.region == high_value_region)),
         "corrupted_honest_node_count": float(len(scenario_state.get("corrupted_honest_nodes", set()))),
         "avg_smart_attacker_remaining_stealth_budget": avg_remaining_budget,
+        "identity_reset_frequency": float(total_resets / max(len(smart_states), 1)),
+        "post_reset_detection_count": float(total_post_reset_detections),
+        "avg_smart_attacker_cumulative_reward": avg_reward,
     }
     return SimulationResult(
         nodes=nodes,
@@ -931,6 +1093,7 @@ def build_network_simulation(
         peer_graph=final_snapshot.peer_graph,
         time_steps=snapshots,
         fraud_scores_over_time=fraud_scores_over_time,
+        uncertainty_over_time=uncertainty_over_time,
         scenario_events=scenario_events,
         scenario_metrics=scenario_metrics,
     )

@@ -26,6 +26,10 @@ BASE_CONFIDENCE = 0.45
 SEPARATION_CONFIDENCE_WEIGHT = 0.35
 EVIDENCE_CONFIDENCE_WEIGHT = 0.20
 MIN_THRESHOLD_EPSILON = 1e-6
+UNCERTAINTY_THRESHOLD_ADJUSTMENT = 0.10
+UNCERTAINTY_THRESHOLD_MIN = 0.20
+UNCERTAINTY_THRESHOLD_MAX = 0.95
+UNCERTAINTY_CONFIDENCE_PENALTY = 0.35
 
 
 class Location(BaseModel):
@@ -48,6 +52,7 @@ class ScoreNodeRequest(BaseModel):
 
 class ScoreNodeResponse(BaseModel):
     fraud_score: float
+    uncertainty_score: float
     risk_label: str
     trend: str
     confidence_score: float
@@ -233,9 +238,25 @@ def score_node(payload: ScoreNodeRequest) -> ScoreNodeResponse:
         if len(vector) != len(feature_columns):
             raise ValueError("Model feature schema mismatch")
         features = pd.DataFrame([vector], columns=feature_columns)
-        fraud_score = float(model.predict_proba(features)[0][1])
-        threshold = float(
+        rf_model = model_bundle.get("rf_model")
+        xgb_model = model_bundle.get("xgb_model")
+        if rf_model is not None and xgb_model is not None:
+            rf_score = float(rf_model.predict_proba(features)[0][1])
+            xgb_score = float(xgb_model.predict_proba(features)[0][1])
+            fraud_score = float((rf_score + xgb_score) / 2.0)
+            uncertainty_score = float(abs(rf_score - xgb_score))
+        else:
+            fraud_score = float(model.predict_proba(features)[0][1])
+            uncertainty_score = 0.0
+        base_threshold = float(
             os.getenv("FRAUD_SCORE_THRESHOLD", model_bundle.get("threshold", DEFAULT_FRAUD_SCORE_THRESHOLD))
+        )
+        threshold = float(
+            np.clip(
+                base_threshold + UNCERTAINTY_THRESHOLD_ADJUSTMENT * uncertainty_score,
+                UNCERTAINTY_THRESHOLD_MIN,
+                UNCERTAINTY_THRESHOLD_MAX,
+            )
         )
         base_map = {}
         for i, feature in enumerate(BASE_FEATURE_COLUMNS):
@@ -266,8 +287,12 @@ def score_node(payload: ScoreNodeRequest) -> ScoreNodeResponse:
                 1.0,
             )
         )
+        confidence_score = float(
+            np.clip(confidence_score * (1.0 - UNCERTAINTY_CONFIDENCE_PENALTY * uncertainty_score), 0.0, 1.0)
+        )
         return ScoreNodeResponse(
             fraud_score=fraud_score,
+            uncertainty_score=uncertainty_score,
             risk_label=risk_label,
             trend=trend,
             confidence_score=confidence_score,

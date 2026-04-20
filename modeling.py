@@ -197,10 +197,13 @@ def train_fraud_model(
             {
                 "model": selected_model,
                 "model_name": selected_model_name,
+                "rf_model": rf_model,
+                "xgb_model": xgb_model,
                 "threshold": selected_report.threshold,
                 "feature_columns": FEATURE_COLUMNS,
                 "feature_importance": selected_importance.to_dict(),
                 "base_feature_importance": base_feature_importance,
+                "uncertainty_mode": "ensemble_disagreement",
             },
             fp,
         )

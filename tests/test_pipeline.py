@@ -64,6 +64,21 @@ class AntiSpoofPipelineTests(unittest.TestCase):
             self.assertIn(artifacts.selected_model_name, {"random_forest", "xgboost"})
             self.assertEqual(set(artifacts.feature_importance["feature"]), set(FEATURE_COLUMNS))
             self.assertEqual(tuple(artifacts.confusion_matrix.shape), (2, 2))
+            adaptive_sim = build_network_simulation(
+                total_nodes=80,
+                time_steps=6,
+                seed=13,
+                model_for_adaptation={
+                    "model": artifacts.model,
+                    "rf_model": artifacts.model,
+                    "xgb_model": artifacts.model,
+                },
+                fraud_score_threshold=artifacts.threshold,
+                feature_columns=FEATURE_COLUMNS,
+            )
+            self.assertEqual(len(adaptive_sim.uncertainty_over_time), 6)
+            self.assertIn("identity_reset_frequency", adaptive_sim.scenario_metrics)
+            self.assertIn("model_degradation_over_time", adaptive_sim.scenario_metrics)
 
             with patch.dict(os.environ, {"MODEL_PATH": model_path}, clear=False):
                 client = TestClient(app)
@@ -87,6 +102,7 @@ class AntiSpoofPipelineTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 200)
                 data = response.json()
                 self.assertIn("fraud_score", data)
+                self.assertIn("uncertainty_score", data)
                 self.assertIn("risk_label", data)
                 self.assertIn("trend", data)
                 self.assertIn("confidence_score", data)
@@ -94,6 +110,8 @@ class AntiSpoofPipelineTests(unittest.TestCase):
                 self.assertTrue(isinstance(data["reasons"], list))
                 self.assertGreaterEqual(float(data["confidence_score"]), 0.0)
                 self.assertLessEqual(float(data["confidence_score"]), 1.0)
+                self.assertGreaterEqual(float(data["uncertainty_score"]), 0.0)
+                self.assertLessEqual(float(data["uncertainty_score"]), 1.0)
                 baseline_score = float(data["fraud_score"])
 
                 increasing_payload = dict(payload)

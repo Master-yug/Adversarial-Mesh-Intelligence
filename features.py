@@ -269,7 +269,10 @@ def _extract_features_from_graph(
 
         peer_coords = np.array([claimed_locations[p] for p in all_neighbors], dtype=float) if all_neighbors else np.zeros((0, 2))
 
-        reciprocity = nx.reciprocity(graph, node_id)
+        try:
+            reciprocity = nx.reciprocity(graph, node_id)
+        except nx.NetworkXError:
+            reciprocity = 0.0
         reciprocity_score = 0.0 if reciprocity is None else float(reciprocity)
 
         feature_row = {
