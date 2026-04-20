@@ -1,0 +1,9 @@
+fastapi
+httpx
+matplotlib
+networkx
+numpy
+pandas
+scikit-learn
+uvicorn
+xgboost==2.1.4
