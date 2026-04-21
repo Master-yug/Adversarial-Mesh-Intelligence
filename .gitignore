@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 model.pkl
 network.png
+demo_output/

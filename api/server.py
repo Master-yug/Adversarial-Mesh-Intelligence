@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import pickle
+import hashlib
+import json
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -11,8 +13,8 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from constants import BASE_FEATURE_COLUMNS, FEATURE_COLUMNS
-from geo import haversine_km
+from utils.constants import BASE_FEATURE_COLUMNS, FEATURE_COLUMNS
+from simulation.geo import haversine_km
 
 DEFAULT_FRAUD_SCORE_THRESHOLD = 0.5
 # API scoring uses a simpler online trust heuristic than offline feature extraction
@@ -22,14 +24,13 @@ API_TRUST_STABILITY_WEIGHT = 0.5
 API_TRUST_STABILITY_SCALE = 150.0
 RISK_TREND_THRESHOLD = 0.03
 FULL_EVIDENCE_LATENCY_COUNT = 8.0
-BASE_CONFIDENCE = 0.45
-SEPARATION_CONFIDENCE_WEIGHT = 0.35
-EVIDENCE_CONFIDENCE_WEIGHT = 0.20
-MIN_THRESHOLD_EPSILON = 1e-6
 UNCERTAINTY_THRESHOLD_ADJUSTMENT = 0.10
 UNCERTAINTY_THRESHOLD_MIN = 0.20
 UNCERTAINTY_THRESHOLD_MAX = 0.95
-UNCERTAINTY_CONFIDENCE_PENALTY = 0.35
+DEFAULT_LATENCY_MS = 20.0
+API_FEATURE_DROPOUT_RATE = float(os.getenv("API_FEATURE_DROPOUT_RATE", "0.0"))
+API_DELAYED_SIGNAL_RATE = float(os.getenv("API_DELAYED_SIGNAL_RATE", "0.0"))
+API_CONFLICTING_EVIDENCE_RATE = float(os.getenv("API_CONFLICTING_EVIDENCE_RATE", "0.0"))
 
 
 class Location(BaseModel):
@@ -38,7 +39,7 @@ class Location(BaseModel):
 
 
 class ScoreNodeRequest(BaseModel):
-    latencies: List[float]
+    latencies: Optional[List[float]] = None
     peers: List[int]
     claimed_location: Location
     inferred_location: Optional[Location] = None
@@ -52,11 +53,15 @@ class ScoreNodeRequest(BaseModel):
 
 class ScoreNodeResponse(BaseModel):
     fraud_score: float
+    uncertainty: float
     uncertainty_score: float
     risk_label: str
     trend: str
     confidence_score: float
     reasons: List[str]
+    top_contributing_features: List[str] = Field(default_factory=list)
+    confidence_reasoning: str = ""
+    uncertainty_sources: List[str] = Field(default_factory=list)
 
 
 @lru_cache(maxsize=1)
@@ -69,12 +74,12 @@ def _load_model_bundle():
 
 
 def _build_feature_vector(payload: ScoreNodeRequest) -> List[float]:
-    latencies = np.array(payload.latencies, dtype=float)
+    latencies = np.array(payload.latencies or [], dtype=float)
     if latencies.size == 0:
-        raise ValueError("latencies must contain at least one value")
+        latencies = np.array([DEFAULT_LATENCY_MS], dtype=float)
     latencies = latencies[np.isfinite(latencies)]
     if latencies.size == 0:
-        raise ValueError("latencies must contain at least one finite value")
+        latencies = np.array([DEFAULT_LATENCY_MS], dtype=float)
 
     inferred = payload.inferred_location or payload.claimed_location
     mismatch = haversine_km(
@@ -167,6 +172,16 @@ def _build_feature_vector(payload: ScoreNodeRequest) -> List[float]:
     base_map["behavior_volatility"] = behavior_volatility
     base_map["sudden_change_score"] = sudden_change
     base_map["burst_activity_score"] = burst_activity
+    seed_payload = json.dumps(payload.model_dump(), sort_keys=True).encode("utf-8")
+    seed_int = int.from_bytes(hashlib.sha256(seed_payload).digest()[:16], byteorder="big", signed=False)
+    rng = np.random.default_rng(seed_int)
+    for key in list(base_map.keys()):
+        if rng.random() < API_FEATURE_DROPOUT_RATE:
+            base_map[key] = 0.0
+        if key.endswith("trend_slope") and rng.random() < API_DELAYED_SIGNAL_RATE:
+            base_map[key] = float(base_map.get(key, 0.0) * 0.5)
+        if key in {"neighbor_trust_score", "reciprocity_score"} and rng.random() < API_CONFLICTING_EVIDENCE_RATE:
+            base_map[key] = float(np.clip(1.0 - base_map.get(key, 0.0), 0.0, 1.0))
 
     feature_values = []
     for feature in BASE_FEATURE_COLUMNS:
@@ -263,6 +278,12 @@ def score_node(payload: ScoreNodeRequest) -> ScoreNodeResponse:
             base_map[feature] = float(vector[i * 3])
         base_feature_importance = model_bundle.get("base_feature_importance", {})
         reasons = _top_reasons(base_map=base_map, base_feature_importance=base_feature_importance, top_k=3)
+        feature_importance_scores = []
+        for feature, value in base_map.items():
+            importance = float(base_feature_importance.get(feature, 0.0))
+            weighted_risk_importance = importance * _feature_risk_signal(feature, float(value))
+            feature_importance_scores.append((weighted_risk_importance, feature))
+        top_features = [f for _, f in sorted(feature_importance_scores, reverse=True)[:3]]
         risk_label = "high_risk" if fraud_score >= threshold else "low_risk"
         score_history = [float(v) for v in (payload.past_fraud_scores or []) if np.isfinite(v)]
         score_history.append(fraud_score)
@@ -276,27 +297,33 @@ def score_node(payload: ScoreNodeRequest) -> ScoreNodeResponse:
                 trend = "stable_risk"
         else:
             trend = "stable_risk"
-        separation = min(abs(fraud_score - threshold) / max(abs(threshold), MIN_THRESHOLD_EPSILON), 1.0)
-        evidence_strength = min(len(payload.latencies) / FULL_EVIDENCE_LATENCY_COUNT, 1.0)
+        evidence_strength = min(len(payload.latencies or []) / FULL_EVIDENCE_LATENCY_COUNT, 1.0)
         confidence_score = float(
-            np.clip(
-                BASE_CONFIDENCE
-                + SEPARATION_CONFIDENCE_WEIGHT * separation
-                + EVIDENCE_CONFIDENCE_WEIGHT * evidence_strength,
-                0.0,
-                1.0,
-            )
+            np.clip((1.0 - uncertainty_score) * (0.55 + 0.45 * evidence_strength), 0.0, 1.0)
         )
-        confidence_score = float(
-            np.clip(confidence_score * (1.0 - UNCERTAINTY_CONFIDENCE_PENALTY * uncertainty_score), 0.0, 1.0)
+        uncertainty_sources = []
+        if not payload.reverse_latencies:
+            uncertainty_sources.append("missing_reverse_latency_observations")
+        if not payload.peer_claimed_locations:
+            uncertainty_sources.append("missing_peer_geolocation_context")
+        if len(payload.latencies or []) < 3:
+            uncertainty_sources.append("sparse_latency_sample")
+        confidence_reasoning = (
+            "high confidence due to consistent model agreement and sufficient evidence"
+            if confidence_score >= 0.7
+            else "reduced confidence due to uncertainty and/or incomplete feature evidence"
         )
         return ScoreNodeResponse(
             fraud_score=fraud_score,
+            uncertainty=uncertainty_score,
             uncertainty_score=uncertainty_score,
             risk_label=risk_label,
             trend=trend,
             confidence_score=confidence_score,
             reasons=reasons,
+            top_contributing_features=top_features,
+            confidence_reasoning=confidence_reasoning,
+            uncertainty_sources=uncertainty_sources,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc

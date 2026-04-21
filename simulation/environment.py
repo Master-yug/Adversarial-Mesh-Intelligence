@@ -7,12 +7,18 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 
-from geo import haversine_km
-from policies import (
+from simulation.geo import haversine_km
+from defender_engine.policies import (
     AdaptiveDefenderPolicy,
     StrategicAttackerPolicy,
     predict_fraud_and_uncertainty,
     summarize_defender_metrics,
+)
+from attacker_engine.strategies import (
+    StrategyLearningState,
+    evolve_strategy_mix,
+    normalize_strategy_mix,
+    update_learning_state,
 )
 
 Coordinate = Tuple[float, float]
@@ -39,7 +45,26 @@ CITY_METADATA: Dict[str, Dict[str, object]] = {
 
 SMART_ATTACKER_BASE_ADAPTATION = 0.08
 SMART_ATTACKER_ADAPTATION_GROWTH = 0.10
-SMART_ATTACKER_STRATEGIES = ("low_and_slow", "burst_attack", "camouflage")
+SMART_ATTACKER_STRATEGIES = (
+    "low_and_slow",
+    "burst_attack",
+    "camouflage",
+    "perfect_mimic",
+    "slow_drift",
+    "decoy_attacker",
+    "mixed_cluster",
+)
+SMART_ATTACKER_STRATEGY_ARRAY = np.array(SMART_ATTACKER_STRATEGIES, dtype=object)
+DEFAULT_SMART_STRATEGY_MIX = {
+    "low_and_slow": 0.22,
+    "burst_attack": 0.16,
+    "camouflage": 0.18,
+    "perfect_mimic": 0.14,
+    "slow_drift": 0.14,
+    "decoy_attacker": 0.08,
+    "mixed_cluster": 0.08,
+}
+WARMUP_REQUIRED_STRATEGIES = {"perfect_mimic", "slow_drift", "mixed_cluster"}
 RATIO_SUM_TOLERANCE = 1e-6
 DEFAULT_TARGET_FEATURE_PRIORITY = (
     "clustering_coefficient",
@@ -90,6 +115,85 @@ HIGH_PROFIT_EXPLOIT_THRESHOLD = 2.2
 DEFENSIVE_UNCERTAINTY_THRESHOLD = 0.45
 DETECTED_ATTACKER_REWARD = 0.55
 UNDETECTED_ATTACKER_REWARD = 2.4
+RESIDUAL_DETECTED_ATTACKER_LEAK = 0.22
+DELAYED_SIGNAL_MIX = 0.65
+MAX_OBSERVATION_LAG = 2
+DETECTION_PENALTY = 1.15
+MIN_CAMPAIGN_SIZE = 3
+MAX_CAMPAIGN_SIZE = 8
+ROLE_POOL = ("leader", "decoy", "executor")
+EXECUTOR_SYNC_WEIGHT = 0.22
+DEFAULT_CAMPAIGN_SYNC_WEIGHT = 0.15
+STRATEGY_RESAMPLING_RATE = 0.38
+
+Difficulties = ("easy", "medium", "hard", "extreme")
+DIFFICULTY_PROFILES: Dict[str, Dict[str, float]] = {
+    "easy": {
+        "noise_multiplier": 0.75,
+        "attacker_intelligence": 0.55,
+        "visibility_multiplier": 1.10,
+        "label_corruption_multiplier": 0.70,
+        "partial_label_rate": 0.10,
+        "delayed_label_steps": 1.0,
+        "suboptimal_action_rate": 0.30,
+        "decision_epsilon": 0.18,
+        "feedback_noise_std": 0.11,
+        "feedback_delay_steps": 2.0,
+        "strategy_mutation_rate": 0.03,
+    },
+    "medium": {
+        "noise_multiplier": 1.00,
+        "attacker_intelligence": 0.72,
+        "visibility_multiplier": 1.00,
+        "label_corruption_multiplier": 1.00,
+        "partial_label_rate": 0.20,
+        "delayed_label_steps": 2.0,
+        "suboptimal_action_rate": 0.22,
+        "decision_epsilon": 0.14,
+        "feedback_noise_std": 0.08,
+        "feedback_delay_steps": 2.0,
+        "strategy_mutation_rate": 0.06,
+    },
+    "hard": {
+        "noise_multiplier": 1.20,
+        "attacker_intelligence": 0.86,
+        "visibility_multiplier": 0.88,
+        "label_corruption_multiplier": 1.35,
+        "partial_label_rate": 0.32,
+        "delayed_label_steps": 3.0,
+        "suboptimal_action_rate": 0.16,
+        "decision_epsilon": 0.10,
+        "feedback_noise_std": 0.05,
+        "feedback_delay_steps": 3.0,
+        "strategy_mutation_rate": 0.11,
+    },
+    "extreme": {
+        "noise_multiplier": 1.38,
+        "attacker_intelligence": 0.94,
+        "visibility_multiplier": 0.76,
+        "label_corruption_multiplier": 1.65,
+        "partial_label_rate": 0.45,
+        "delayed_label_steps": 4.0,
+        "suboptimal_action_rate": 0.10,
+        "decision_epsilon": 0.08,
+        "feedback_noise_std": 0.03,
+        "feedback_delay_steps": 4.0,
+        "strategy_mutation_rate": 0.16,
+    },
+}
+DEFENDER_BUDGET_FRACTION_BY_DIFFICULTY: Dict[str, float] = {
+    "easy": 0.09,
+    "medium": 0.07,
+    "hard": 0.05,
+    "extreme": 0.04,
+}
+
+
+def _difficulty_profile(level: str) -> Dict[str, float]:
+    key = str(level).strip().lower()
+    if key not in DIFFICULTY_PROFILES:
+        raise ValueError(f"difficulty_level must be one of {Difficulties}")
+    return dict(DIFFICULTY_PROFILES[key])
 
 
 @dataclass(frozen=True)
@@ -105,6 +209,9 @@ class NodeRecord:
     anomalous_honest: bool
     unstable_connection: bool
     attacker_strategy: str | None = None
+    gray_zone: bool = False
+    ambiguity_anchor: bool = False
+    visibility_variance: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -150,6 +257,8 @@ def _sample_honest_nodes(
     rng: np.random.Generator,
     anomaly_rate: float,
     unstable_rate: float,
+    gray_zone_rate: float,
+    ambiguity_floor_rate: float,
 ) -> List[NodeRecord]:
     city_names = list(CITY_METADATA.keys())
     rows: List[NodeRecord] = []
@@ -161,6 +270,8 @@ def _sample_honest_nodes(
         lon = float(base_lon + rng.normal(0.0, 2.2))
         is_anomalous = bool(rng.random() < anomaly_rate)
         is_unstable = bool(rng.random() < unstable_rate)
+        is_gray_zone = bool(rng.random() < gray_zone_rate)
+        ambiguity_anchor = bool(rng.random() < ambiguity_floor_rate)
         rows.append(
             NodeRecord(
                 node_id=int(node_id),
@@ -174,6 +285,9 @@ def _sample_honest_nodes(
                 anomalous_honest=is_anomalous,
                 unstable_connection=is_unstable,
                 attacker_strategy=None,
+                gray_zone=is_gray_zone,
+                ambiguity_anchor=ambiguity_anchor or is_gray_zone,
+                visibility_variance=float(rng.uniform(0.0, 0.35 if is_gray_zone else 0.20)),
             )
         )
     return rows
@@ -219,13 +333,35 @@ def _sample_smart_attacker_strategies(
     rng: np.random.Generator,
     strategy_mix: Dict[str, float] | None = None,
 ) -> Dict[int, str]:
-    mix = strategy_mix or {"low_and_slow": 0.4, "burst_attack": 0.3, "camouflage": 0.3}
+    mix = dict(strategy_mix or DEFAULT_SMART_STRATEGY_MIX)
+    if "decoy" in mix:
+        mix["decoy_attacker"] = float(mix.get("decoy_attacker", 0.0)) + float(mix["decoy"])
+        mix.pop("decoy", None)
     probs = np.array([float(mix.get(strategy, 0.0)) for strategy in SMART_ATTACKER_STRATEGIES], dtype=float)
     if probs.sum() <= 0:
-        probs = np.array([0.4, 0.3, 0.3], dtype=float)
+        probs = np.array([1.0 / len(SMART_ATTACKER_STRATEGIES)] * len(SMART_ATTACKER_STRATEGIES), dtype=float)
     probs = probs / probs.sum()
     strategies = rng.choice(SMART_ATTACKER_STRATEGIES, size=len(node_ids), replace=True, p=probs)
     return {int(node_id): str(strategy) for node_id, strategy in zip(node_ids, strategies)}
+
+
+def _compose_smart_strategy_mix(
+    strategy_mix: Dict[str, float] | None,
+    attacker_sophistication: float,
+) -> Dict[str, float]:
+    mix = normalize_strategy_mix(strategy_mix or DEFAULT_SMART_STRATEGY_MIX)
+    stealth = float(np.clip(attacker_sophistication, 0.0, 1.0))
+    mix["perfect_mimic"] = float(mix.get("perfect_mimic", 0.0) + 0.22 * stealth)
+    mix["slow_drift"] = float(mix.get("slow_drift", 0.0) + 0.18 * stealth)
+    mix["mixed_cluster"] = float(mix.get("mixed_cluster", 0.0) + 0.14 * stealth)
+    mix["decoy_attacker"] = float(mix.get("decoy_attacker", 0.0) + float(mix.get("decoy", 0.0)) + 0.15 * stealth)
+    mix.pop("decoy", None)
+    mix["burst_attack"] = float(max(0.01, mix.get("burst_attack", 0.0) - 0.20 * stealth))
+    mix["low_and_slow"] = float(max(0.02, mix.get("low_and_slow", 0.0) - 0.08 * stealth))
+    total = float(sum(max(v, 0.0) for v in mix.values()))
+    if total <= 0.0:
+        return normalize_strategy_mix(DEFAULT_SMART_STRATEGY_MIX)
+    return normalize_strategy_mix({k: float(max(v, 0.0) / total) for k, v in mix.items()})
 
 
 def _sample_smart_attackers(
@@ -244,7 +380,7 @@ def _sample_smart_attackers(
         real_lon = float(base_lon + rng.normal(0.0, 1.3))
 
         strategy = strategies[int(node_id)]
-        fake_probability = 0.20 if strategy == "low_and_slow" else 0.35
+        fake_probability = 0.12 if strategy in {"low_and_slow", "perfect_mimic"} else 0.30
         if target_region and rng.random() < SMART_ATTACKER_TARGET_REGION_PROB:
             fake_city = target_region
             fake_city_meta = _city_meta_or_default(fake_city)
@@ -277,6 +413,9 @@ def _sample_smart_attackers(
                 anomalous_honest=False,
                 unstable_connection=False,
                 attacker_strategy=strategy,
+                gray_zone=False,
+                ambiguity_anchor=bool(strategy in {"perfect_mimic", "mixed_cluster"}),
+                visibility_variance=float(rng.uniform(0.05, 0.30)),
             )
         )
     return rows
@@ -287,6 +426,7 @@ def _initialize_smart_states(
     total_timesteps: int,
     rng: np.random.Generator,
     feature_priority: Sequence[str],
+    attacker_sophistication: float,
 ) -> Dict[int, Dict[str, object]]:
     """Create per-smart-attacker adaptive state with stealth budgets and feature targeting priority."""
     states: Dict[int, Dict[str, object]] = {}
@@ -300,13 +440,25 @@ def _initialize_smart_states(
                 max(2, (2 * total_timesteps) // 3 + 1),
             )
         )
+        warmup_steps = int(
+            rng.integers(
+                2,
+                max(3, min(total_timesteps, 7)),
+            )
+        )
         states[node.node_id] = {
             "strategy": strategy,
             "adaptation_strength": SMART_ATTACKER_BASE_ADAPTATION,
             "clustering_bias": 0.55,
-            "latency_noise_scale": 0.35,
-            "honest_connection_bias": 0.45 if strategy == "camouflage" else 0.25,
-            "randomization": 0.15,
+            "latency_noise_scale": float(max(0.05, 0.35 - 0.15 * attacker_sophistication)),
+            "honest_connection_bias": float(
+                np.clip(
+                    (0.45 if strategy == "camouflage" else 0.25) + 0.25 * attacker_sophistication,
+                    0.0,
+                    1.0,
+                )
+            ),
+            "randomization": float(np.clip(0.15 + 0.18 * attacker_sophistication, 0.0, 1.0)),
             "exploit_pressure": 0.30,
             "connection_expansion": 0.0,
             "burst_start_timestep": burst_start,
@@ -330,6 +482,19 @@ def _initialize_smart_states(
             "last_identity_reset_timestep": NO_RESET_SENTINEL,
             "post_reset_detections": 0,
             "detected_since_reset": False,
+            "warmup_steps": warmup_steps if strategy in WARMUP_REQUIRED_STRATEGIES else 1,
+            "drift_strength": 0.0 if strategy == "slow_drift" else 1.0,
+            "is_decoy": bool(strategy == "decoy_attacker" and rng.random() < 0.55),
+            "blend_probability": float(
+                0.18
+                + (
+                    0.22
+                    if strategy in {"perfect_mimic", "mixed_cluster", "decoy_attacker", "slow_drift"}
+                    else 0.0
+                )
+                + float(rng.uniform(0.0, 0.10))
+            ),
+            "signal_history": [],
         }
     return states
 
@@ -355,6 +520,60 @@ def _smart_state_for_edge(
     if nj.label == "smart_attacker":
         return smart_states.get(nj.node_id)
     return None
+
+
+def _initialize_attack_campaigns(
+    smart_states: Dict[int, Dict[str, object]],
+    rng: np.random.Generator,
+) -> Dict[int, Dict[str, object]]:
+    smart_ids = list(smart_states.keys())
+    if not smart_ids:
+        return {}
+    campaigns: Dict[int, Dict[str, object]] = {}
+    rng.shuffle(smart_ids)
+    campaign_id = 0
+    index = 0
+    while index < len(smart_ids):
+        size = int(rng.integers(MIN_CAMPAIGN_SIZE, MAX_CAMPAIGN_SIZE + 1))
+        group = smart_ids[index : index + size]
+        if len(group) < MIN_CAMPAIGN_SIZE:
+            group = smart_ids[max(0, len(smart_ids) - MIN_CAMPAIGN_SIZE) :]
+        index += max(len(group), 1)
+        if not group:
+            break
+        leader = int(group[0])
+        roles: Dict[int, str] = {}
+        for pos, node_id in enumerate(group):
+            if pos == 0:
+                role = "leader"
+            else:
+                role = str(rng.choice(np.array(ROLE_POOL[1:], dtype=object)))
+            roles[int(node_id)] = role
+            smart_states[int(node_id)]["campaign_id"] = campaign_id
+            smart_states[int(node_id)]["campaign_role"] = role
+            smart_states[int(node_id)]["campaign_leader"] = leader
+        campaigns[campaign_id] = {"members": list(group), "leader": leader, "roles": roles}
+        campaign_id += 1
+    return campaigns
+
+
+def _strategy_rewards_from_states(
+    smart_states: Dict[int, Dict[str, object]],
+    threshold: float,
+) -> Dict[str, float]:
+    grouped_rewards: Dict[str, List[float]] = {}
+    for state in smart_states.values():
+        strategy = str(state.get("strategy", "low_and_slow"))
+        score = float(np.clip(state.get("fraud_score", 0.0), 0.0, 1.0))
+        detected = score >= threshold
+        latest_profit = float(state.get("latest_reward", 0.0))
+        reward = latest_profit - (DETECTION_PENALTY if detected else 0.0)
+        grouped_rewards.setdefault(strategy, []).append(float(reward))
+    return {
+        strategy: float(np.mean(values))
+        for strategy, values in grouped_rewards.items()
+        if values
+    }
 
 
 def _derive_feature_priority(
@@ -463,8 +682,11 @@ def _build_latency_matrix(
     measurement_error_std: float,
     packet_loss_rate: float,
     missing_latency_rate: float,
+    delayed_observation_rate: float,
+    noise_spike_rate: float,
     smart_states: Dict[int, Dict[str, object]],
     scenario_state: Dict[str, Any],
+    lag_reference_matrices: Sequence[np.ndarray] | None = None,
 ) -> np.ndarray:
     total_nodes = len(nodes)
     matrix = np.full((total_nodes, total_nodes), np.nan, dtype=float)
@@ -517,6 +739,24 @@ def _build_latency_matrix(
                 elif strategy == "camouflage":
                     base *= 1.06
                     noise_scale *= 1.1
+                elif strategy == "perfect_mimic":
+                    base = _non_linear_latency(distance, continent_penalty, rng) * float(rng.uniform(0.96, 1.06))
+                    noise_scale *= 0.55
+                elif strategy == "slow_drift":
+                    warmup = int(smart_state.get("warmup_steps", 2))
+                    drift_phase = max(0.0, (timestep - warmup) / max(total_timesteps - warmup, 1))
+                    base *= float(1.04 - 0.33 * drift_phase)
+                    noise_scale *= float(0.75 + 0.70 * drift_phase)
+                elif strategy == "decoy_attacker":
+                    if bool(smart_state.get("is_decoy", False)):
+                        base *= float(rng.uniform(0.20, 0.55))
+                        noise_scale *= 1.8
+                    else:
+                        base *= float(rng.uniform(0.92, 1.12))
+                        noise_scale *= 0.8
+                elif strategy == "mixed_cluster":
+                    base *= float(rng.uniform(0.85, 1.05))
+                    noise_scale *= 0.9
 
                 stealth_noise = float(rng.normal(0.0, 6.0 * (1.0 + noise_scale + adaptation)))
                 base = max(1.0, base + stealth_noise)
@@ -528,6 +768,12 @@ def _build_latency_matrix(
                 base += float(rng.normal(0.0, 12.0))
                 if rng.random() < 0.08:
                     base += float(rng.uniform(60.0, 180.0))
+            if ni.gray_zone or nj.gray_zone:
+                base += float(rng.normal(0.0, 18.0))
+                if rng.random() < 0.22:
+                    base *= float(rng.uniform(0.45, 1.45))
+            if ni.ambiguity_anchor or nj.ambiguity_anchor:
+                base += float(rng.normal(0.0, 8.0))
 
             latency_ij = max(1.0, base + float(rng.normal(0.0, 2.5)))
             latency_ji = max(1.0, base + float(rng.normal(0.0, 2.5)))
@@ -539,6 +785,21 @@ def _build_latency_matrix(
 
             latency_ij *= max(0.65, 1.0 + float(rng.normal(0.0, measurement_error_std)))
             latency_ji *= max(0.65, 1.0 + float(rng.normal(0.0, measurement_error_std)))
+            if rng.random() < noise_spike_rate:
+                latency_ij += float(rng.normal(0.0, 45.0))
+            if rng.random() < noise_spike_rate:
+                latency_ji += float(rng.normal(0.0, 45.0))
+
+            if lag_reference_matrices and rng.random() < delayed_observation_rate:
+                lag = lag_reference_matrices[int(rng.integers(0, len(lag_reference_matrices)))]
+                lag_ij = float(lag[i, j])
+                if np.isfinite(lag_ij):
+                    latency_ij = lag_ij
+            if lag_reference_matrices and rng.random() < delayed_observation_rate:
+                lag = lag_reference_matrices[int(rng.integers(0, len(lag_reference_matrices)))]
+                lag_ji = float(lag[j, i])
+                if np.isfinite(lag_ji):
+                    latency_ji = lag_ji
 
             if rng.random() < packet_loss_rate:
                 latency_ij = np.nan
@@ -605,6 +866,8 @@ def _build_peer_graph(
             anomalous_honest=node.anomalous_honest,
             unstable_connection=node.unstable_connection,
             attacker_strategy=node.attacker_strategy,
+            gray_zone=node.gray_zone,
+            ambiguity_anchor=node.ambiguity_anchor,
         )
 
     smart_external_bias = 0.45 + 0.2 * (timestep / max(1, total_timesteps - 1))
@@ -621,7 +884,19 @@ def _build_peer_graph(
             k = int(rng.integers(7, 15))
             if node.unstable_connection:
                 k = max(3, int(round(k * rng.uniform(0.45, 0.75))))
-            peers = _choose_peers(i, base_candidates, latency_matrix[i], k, rng)
+            if node.gray_zone:
+                k = max(4, int(round(k * rng.uniform(0.65, 1.15))))
+            if (node.anomalous_honest or node.gray_zone or node.ambiguity_anchor) and rng.random() < 0.24:
+                attacker_like_k = max(3, int(round(k * rng.uniform(0.55, 1.20))))
+                attacker_pool = np.setdiff1d(attacker_ids, np.array([i]))
+                attacker_target = int(round(attacker_like_k * rng.uniform(0.30, 0.62)))
+                attacker_peers = _choose_peers(i, attacker_pool, latency_matrix[i], attacker_target, rng)
+                honest_remainder = attacker_like_k - attacker_peers.size
+                honest_pool = np.setdiff1d(honest_ids, np.array([i]))
+                honest_peers = _choose_peers(i, honest_pool, latency_matrix[i], honest_remainder, rng)
+                peers = np.unique(np.concatenate([attacker_peers, honest_peers]))
+            else:
+                peers = _choose_peers(i, base_candidates, latency_matrix[i], k, rng)
         elif node.label == "naive_attacker" or i in corrupted_honest:
             k = int(rng.integers(9, 16))
             mostly_attackers = int(round(k * rng.uniform(0.72, 0.9)))
@@ -636,11 +911,13 @@ def _build_peer_graph(
         else:
             state = smart_states.get(i, {})
             strategy = str(state.get("strategy", "low_and_slow"))
+            warmup_steps = int(state.get("warmup_steps", 1))
             clustering_bias = float(state.get("clustering_bias", 0.55))
             honest_connection_bias = float(state.get("honest_connection_bias", 0.25))
             exploit_pressure = float(state.get("exploit_pressure", 0.30))
             randomization = float(state.get("randomization", 0.15))
             burst_active = bool(state.get("burst_active", False))
+            in_warmup = timestep < warmup_steps
 
             if strategy == "low_and_slow":
                 k = int(rng.integers(6, 12))
@@ -665,6 +942,25 @@ def _build_peer_graph(
             elif strategy == "camouflage":
                 attacker_ratio *= 0.40
                 honest_connection_bias = max(honest_connection_bias, 0.55)
+            elif strategy == "perfect_mimic":
+                attacker_ratio *= 0.25
+                honest_connection_bias = max(honest_connection_bias, 0.70)
+            elif strategy == "slow_drift":
+                phase = max(0.0, (timestep - warmup_steps) / max(total_timesteps - warmup_steps, 1))
+                attacker_ratio *= float(0.35 + 1.10 * phase)
+            elif strategy == "decoy_attacker":
+                attacker_ratio *= 1.45 if bool(state.get("is_decoy", False)) else 0.30
+            elif strategy == "mixed_cluster":
+                attacker_ratio *= 0.55
+                honest_connection_bias = max(honest_connection_bias, 0.55)
+            if rng.random() < float(state.get("blend_probability", 0.2)):
+                attacker_ratio *= float(rng.uniform(0.35, 0.78))
+                honest_connection_bias = min(1.0, max(honest_connection_bias, float(rng.uniform(0.55, 0.92))))
+                randomization = min(1.0, randomization + float(rng.uniform(0.08, 0.22)))
+
+            if in_warmup:
+                attacker_ratio *= 0.35
+                honest_connection_bias = min(1.0, honest_connection_bias + 0.25)
             if i in sybil_nodes and sybil_nodes:
                 attacker_ratio = min(MAX_SYBIL_ATTACKER_RATIO, attacker_ratio + SYBIL_ATTACKER_RATIO_BOOST)
 
@@ -689,7 +985,10 @@ def _build_peer_graph(
             peers = fallback
 
         for p in peers:
-            if rng.random() < partial_visibility_rate:
+            visibility_drop = partial_visibility_rate + node.visibility_variance * float(rng.uniform(0.0, 0.9))
+            if node.gray_zone:
+                visibility_drop += 0.06
+            if rng.random() < visibility_drop:
                 continue
             latency = latency_matrix[i, int(p)]
             if not np.isfinite(latency):
@@ -732,6 +1031,7 @@ def _score_snapshot_for_adaptation(
 
 def _update_smart_attacker_states(
     smart_states: Dict[int, Dict[str, object]],
+    campaigns: Dict[int, Dict[str, object]],
     fraud_scores: Dict[int, float],
     uncertainty_scores: Dict[int, float],
     model_df: pd.DataFrame,
@@ -743,6 +1043,10 @@ def _update_smart_attacker_states(
     total_timesteps: int,
     adaptation_base: float,
     adaptation_growth: float,
+    suboptimal_action_rate: float,
+    decision_epsilon: float,
+    feedback_noise_std: float,
+    feedback_delay_steps: int,
     rng: np.random.Generator,
 ) -> None:
     feature_rows = {int(row["node_id"]): row for _, row in model_df.iterrows()}
@@ -753,8 +1057,30 @@ def _update_smart_attacker_states(
         )
         score = float(fraud_scores.get(node_id, 0.0))
         uncertainty = float(uncertainty_scores.get(node_id, 0.0))
+        signal_history = [float(v) for v in state.get("signal_history", [])]
+        signal_history.append(score)
+        signal_history = signal_history[-12:]
+        state["signal_history"] = signal_history
+        delayed_idx = max(0, len(signal_history) - 1 - max(int(feedback_delay_steps), 0))
+        delayed_score = float(signal_history[delayed_idx]) if signal_history else score
+        perceived_score = float(np.clip(delayed_score + rng.normal(0.0, feedback_noise_std), 0.0, 1.0))
         state["fraud_score"] = score
+        state["perceived_fraud_score"] = perceived_score
         state["adaptation_strength"] = adaptation_strength
+        campaign_id = state.get("campaign_id")
+        if campaign_id is not None and campaign_id in campaigns:
+            campaign_role = str(state.get("campaign_role", "executor"))
+            campaign = campaigns[campaign_id]
+            leader_id = int(campaign.get("leader", node_id))
+            leader_score = float(fraud_scores.get(leader_id, score))
+            leader_strategy = str(smart_states.get(leader_id, {}).get("strategy", strategy))
+            role_synchronization = EXECUTOR_SYNC_WEIGHT if campaign_role == "executor" else DEFAULT_CAMPAIGN_SYNC_WEIGHT
+            perceived_score = float(np.clip((1.0 - role_synchronization) * perceived_score + role_synchronization * leader_score, 0.0, 1.0))
+            state["perceived_fraud_score"] = perceived_score
+            if campaign_role != "leader" and rng.random() < 0.30:
+                state["strategy"] = leader_strategy
+        else:
+            campaign_role = "executor"
 
         state["burst_active"] = strategy == "burst_attack" and timestep >= int(state.get("burst_start_timestep", 0))
         state["connection_expansion"] = max(0.0, float(state.get("connection_expansion", 0.0)) - 0.03)
@@ -773,11 +1099,22 @@ def _update_smart_attacker_states(
                 feature_row=node_row,
                 feature_columns=feature_columns,
                 model_bundle=model_for_adaptation,
-                current_score=score,
+                current_score=perceived_score,
                 threshold=threshold,
                 recent_profit=recent_profit,
             )
             selected_action = decision.action
+            if campaign_role == "decoy" and selected_action != "add_noise":
+                if "add_noise" in STEALTH_ACTION_COSTS:
+                    selected_action = "add_noise"
+            if campaign_role == "leader" and selected_action == "noop" and perceived_score >= threshold:
+                selected_action = "reduce_clustering"
+            if rng.random() < float(np.clip(decision_epsilon, 0.0, 1.0)):
+                selected_action = str(rng.choice(np.array(list(STEALTH_ACTION_COSTS.keys()), dtype=object)))
+            if rng.random() < float(np.clip(suboptimal_action_rate, 0.0, 1.0)):
+                non_best = [a for a in STEALTH_ACTION_COSTS if a != decision.action]
+                if non_best:
+                    selected_action = str(rng.choice(np.array(non_best, dtype=object)))
             action_cost = float(STEALTH_ACTION_COSTS.get(selected_action, 0.0))
             if action_cost <= budget and selected_action != "noop":
                 _apply_targeted_action(state=state, action=selected_action, adaptation_strength=adaptation_strength, rng=rng)
@@ -799,13 +1136,13 @@ def _update_smart_attacker_states(
 
         if recent_profit >= HIGH_PROFIT_EXPLOIT_THRESHOLD:
             state["exploit_pressure"] = min(1.0, float(state["exploit_pressure"]) + 0.10)
-        if score >= threshold or uncertainty >= DEFENSIVE_UNCERTAINTY_THRESHOLD:
+        if perceived_score >= threshold or uncertainty >= DEFENSIVE_UNCERTAINTY_THRESHOLD:
             state["latency_noise_scale"] = min(3.0, float(state["latency_noise_scale"]) + 0.08)
             state["clustering_bias"] = max(0.02, float(state["clustering_bias"]) - 0.05)
 
         last_reset = int(state.get("last_identity_reset_timestep", NO_RESET_SENTINEL))
         reset_trigger = (
-            score >= threshold * IDENTITY_RESET_HIGH_SCORE_FACTOR
+            perceived_score >= threshold * IDENTITY_RESET_HIGH_SCORE_FACTOR
             or recent_profit <= IDENTITY_RESET_LOW_REWARD_THRESHOLD
         )
         if reset_trigger and (timestep - last_reset) >= IDENTITY_RESET_COOLDOWN_TIMESTEPS:
@@ -813,14 +1150,14 @@ def _update_smart_attacker_states(
             state["identity_reset_count"] = reset_count
             state["public_node_id"] = f"node-{node_id}-reset-{reset_count}"
             state["last_identity_reset_timestep"] = timestep
-            state["detected_since_reset"] = score >= threshold
+            state["detected_since_reset"] = perceived_score >= threshold
             state["stealth_budget"] = max_budget
             state["exploit_pressure"] = max(0.0, float(state["exploit_pressure"]) - 0.25)
             state["honest_connection_bias"] = min(1.0, float(state["honest_connection_bias"]) + 0.20)
             state["randomization"] = min(1.0, float(state["randomization"]) + 0.12)
         else:
             has_reset_before = int(state.get("last_identity_reset_timestep", NO_RESET_SENTINEL)) != NO_RESET_SENTINEL
-            if has_reset_before and score >= threshold:
+            if has_reset_before and perceived_score >= threshold:
                 state["post_reset_detections"] = int(state.get("post_reset_detections", 0)) + 1
 
         if strategy == "low_and_slow":
@@ -830,6 +1167,22 @@ def _update_smart_attacker_states(
             state["honest_connection_bias"] = max(float(state["honest_connection_bias"]), 0.55)
         elif strategy == "burst_attack" and bool(state["burst_active"]) and score < threshold:
             state["exploit_pressure"] = min(1.0, float(state["exploit_pressure"]) + 0.25 + float(rng.uniform(0.0, 0.2)))
+        elif strategy == "perfect_mimic":
+            state["latency_noise_scale"] = max(0.05, float(state["latency_noise_scale"]) * 0.92)
+            state["honest_connection_bias"] = min(1.0, max(float(state["honest_connection_bias"]), 0.72))
+        elif strategy == "slow_drift":
+            warmup = int(state.get("warmup_steps", 1))
+            phase = max(0.0, (timestep - warmup) / max(total_timesteps - warmup, 1))
+            state["drift_strength"] = phase
+            state["exploit_pressure"] = float(np.clip(0.20 + 0.75 * phase, 0.0, 1.0))
+        elif strategy == "decoy_attacker":
+            if bool(state.get("is_decoy", False)):
+                state["exploit_pressure"] = min(1.0, float(state["exploit_pressure"]) + 0.14)
+                state["latency_noise_scale"] = min(3.0, float(state["latency_noise_scale"]) + 0.20)
+            else:
+                state["honest_connection_bias"] = min(1.0, float(state["honest_connection_bias"]) + 0.08)
+        elif strategy == "mixed_cluster":
+            state["honest_connection_bias"] = min(1.0, max(float(state["honest_connection_bias"]), 0.58))
 
 
 def _update_attacker_economic_feedback(
@@ -839,10 +1192,12 @@ def _update_attacker_economic_feedback(
 ) -> None:
     for node_id, state in smart_states.items():
         detected = float(fraud_scores.get(node_id, 0.0)) >= threshold
-        reward = DETECTED_ATTACKER_REWARD if detected else UNDETECTED_ATTACKER_REWARD
+        leakage = RESIDUAL_DETECTED_ATTACKER_LEAK * float(np.clip(state.get("exploit_pressure", 0.3), 0.0, 1.0))
+        reward = (DETECTED_ATTACKER_REWARD + leakage) if detected else UNDETECTED_ATTACKER_REWARD
         reward_history = list(state.get("reward_history", []))
         reward_history.append(float(reward))
         state["reward_history"] = reward_history[-24:]
+        state["latest_reward"] = float(reward)
         state["cumulative_reward"] = float(state.get("cumulative_reward", 0.0)) + float(reward)
         if reward >= (UNDETECTED_ATTACKER_REWARD - 0.3):
             state["exploit_pressure"] = min(1.0, float(state.get("exploit_pressure", 0.3)) + 0.06)
@@ -860,10 +1215,18 @@ def build_network_simulation(
     attacker_cluster_continent: str = "asia",
     honest_anomaly_rate: float = 0.12,
     honest_unstable_rate: float = 0.10,
+    gray_zone_rate: float = 0.10,
+    ambiguity_floor_rate: float = 0.04,
     measurement_error_std: float = 0.05,
     missing_latency_rate: float = 0.03,
     packet_loss_rate: float = 0.04,
     partial_visibility_rate: float = 0.06,
+    delayed_observation_rate: float = 0.06,
+    noise_spike_rate: float = 0.025,
+    noise_level: float = 0.30,
+    attacker_sophistication: float = 0.72,
+    visibility_level: float = 0.74,
+    label_noise_rate: float = 0.04,
     time_steps: int = 15,
     seed: int = 42,
     adaptation_base: float = SMART_ATTACKER_BASE_ADAPTATION,
@@ -876,6 +1239,7 @@ def build_network_simulation(
     enable_system_attacks: bool = True,
     defender_retrain_interval: int = 4,
     defender_window_size: int = 6,
+    difficulty_level: str = "medium",
 ) -> SimulationResult:
     if total_nodes < 10:
         raise ValueError("total_nodes must be at least 10 for a meaningful topology")
@@ -887,6 +1251,34 @@ def build_network_simulation(
         raise ValueError("Node-type ratios must sum to 1.0")
 
     rng = np.random.default_rng(seed)
+    normalized_difficulty_level = str(difficulty_level).strip().lower()
+    difficulty = _difficulty_profile(normalized_difficulty_level)
+    noise_level = float(np.clip(noise_level, 0.0, 1.0))
+    noise_level = float(np.clip(noise_level * float(difficulty["noise_multiplier"]), 0.0, 1.0))
+    attacker_sophistication = float(np.clip(attacker_sophistication * float(difficulty["attacker_intelligence"]), 0.0, 1.0))
+    visibility_level = float(np.clip(visibility_level * float(difficulty["visibility_multiplier"]), 0.0, 1.0))
+    label_noise_rate = float(
+        np.clip(label_noise_rate * float(difficulty["label_corruption_multiplier"]), 0.0, 0.25)
+    )
+    partial_label_rate = float(np.clip(difficulty["partial_label_rate"], 0.0, 0.75))
+    delayed_label_steps = int(max(0, round(float(difficulty["delayed_label_steps"]))))
+    suboptimal_action_rate = float(np.clip(difficulty["suboptimal_action_rate"], 0.0, 0.50))
+    decision_epsilon = float(np.clip(difficulty["decision_epsilon"], 0.0, 0.50))
+    feedback_noise_std = float(np.clip(difficulty["feedback_noise_std"], 0.0, 0.35))
+    feedback_delay_steps = int(max(0, round(float(difficulty["feedback_delay_steps"]))))
+    strategy_mutation_rate = float(np.clip(difficulty["strategy_mutation_rate"], 0.0, 0.40))
+    budget_fraction = float(DEFENDER_BUDGET_FRACTION_BY_DIFFICULTY.get(normalized_difficulty_level, 0.07))
+    defender_action_budget = int(max(3, round(total_nodes * budget_fraction)))
+
+    measurement_error_std = float(measurement_error_std * (1.0 + 1.8 * noise_level))
+    missing_latency_rate = float(np.clip(missing_latency_rate + 0.10 * noise_level + 0.08 * (1.0 - visibility_level), 0.0, 0.45))
+    packet_loss_rate = float(np.clip(packet_loss_rate + 0.08 * noise_level + 0.05 * (1.0 - visibility_level), 0.0, 0.45))
+    delayed_observation_rate = float(np.clip(delayed_observation_rate + 0.12 * noise_level, 0.0, 0.55))
+    partial_visibility_rate = float(np.clip(partial_visibility_rate + 0.16 * (1.0 - visibility_level) + 0.08 * noise_level, 0.0, 0.60))
+    noise_spike_rate = float(np.clip(noise_spike_rate + 0.08 * noise_level, 0.0, 0.35))
+    honest_anomaly_rate = float(np.clip(honest_anomaly_rate + 0.14 * noise_level, 0.0, 0.55))
+    gray_zone_rate = float(np.clip(gray_zone_rate + 0.10 * noise_level, 0.0, 0.55))
+    ambiguity_floor_rate = float(np.clip(ambiguity_floor_rate + 0.08 * noise_level, 0.0, 0.40))
 
     honest_count = int(round(total_nodes * honest_ratio))
     naive_count = int(round(total_nodes * naive_attacker_ratio))
@@ -911,12 +1303,23 @@ def build_network_simulation(
     honest_ids = ids[:honest_count]
     naive_ids = ids[honest_count : honest_count + naive_count]
     smart_ids = ids[honest_count + naive_count :]
-    smart_strategies = _sample_smart_attacker_strategies(smart_ids, rng, strategy_mix=smart_strategy_mix)
+    effective_strategy_mix = _compose_smart_strategy_mix(
+        strategy_mix=smart_strategy_mix,
+        attacker_sophistication=attacker_sophistication,
+    )
+    smart_strategies = _sample_smart_attacker_strategies(smart_ids, rng, strategy_mix=effective_strategy_mix)
     high_value_regions = ["new_york", "tokyo", "london", "singapore"]
     high_value_region = str(high_value_regions[int(rng.integers(0, len(high_value_regions)))])
 
     nodes = (
-        _sample_honest_nodes(honest_ids, rng, anomaly_rate=honest_anomaly_rate, unstable_rate=honest_unstable_rate)
+        _sample_honest_nodes(
+            honest_ids,
+            rng,
+            anomaly_rate=honest_anomaly_rate,
+            unstable_rate=honest_unstable_rate,
+            gray_zone_rate=gray_zone_rate,
+            ambiguity_floor_rate=ambiguity_floor_rate,
+        )
         + _sample_naive_attackers(
             naive_ids,
             attacker_cluster_center,
@@ -928,7 +1331,15 @@ def build_network_simulation(
     )
     feature_columns = tuple(feature_columns or [])
     feature_priority = _derive_feature_priority(model_for_adaptation, feature_columns, top_k=smart_target_top_k)
-    smart_states = _initialize_smart_states(nodes, total_timesteps=time_steps, rng=rng, feature_priority=feature_priority)
+    smart_states = _initialize_smart_states(
+        nodes,
+        total_timesteps=time_steps,
+        rng=rng,
+        feature_priority=feature_priority,
+        attacker_sophistication=attacker_sophistication,
+    )
+    campaigns = _initialize_attack_campaigns(smart_states=smart_states, rng=rng)
+    learning_state = StrategyLearningState(strategy_mix=effective_strategy_mix, temperature=0.28)
     attacker_policy = StrategicAttackerPolicy()
     defender_policy = AdaptiveDefenderPolicy(
         base_threshold=fraud_score_threshold,
@@ -936,6 +1347,9 @@ def build_network_simulation(
         sliding_window_steps=defender_window_size,
         dynamic_threshold=True,
         quarantine_duration=2,
+        action_budget_per_step=defender_action_budget,
+        threshold_exploration_rate=float(np.clip(0.16 - 0.10 * attacker_sophistication, 0.03, 0.20)),
+        random_state=seed + 17,
     )
     defender_policy.register_nodes([node.node_id for node in nodes])
     scenario_state: Dict[str, Any] = {
@@ -950,8 +1364,12 @@ def build_network_simulation(
     fraud_scores_over_time: List[Dict[int, float]] = []
     uncertainty_over_time: List[Dict[int, float]] = []
     scenario_events: List[AttackScenarioEvent] = []
+    lag_history: List[np.ndarray] = []
+    delayed_scores: Dict[int, float] = {}
+    strategy_dominance_over_time: List[float] = []
 
     for timestep in range(time_steps):
+        defender_policy.prepare_timestep(timestep)
         if enable_system_attacks:
             scenario_events.extend(_activate_attack_scenarios(timestep=timestep, nodes=nodes, scenario_state=scenario_state, rng=rng))
         quarantined_nodes = {node_id for node_id in smart_states if defender_policy.is_quarantined(node_id, timestep)}
@@ -963,9 +1381,15 @@ def build_network_simulation(
             measurement_error_std=measurement_error_std,
             packet_loss_rate=packet_loss_rate,
             missing_latency_rate=missing_latency_rate,
+            delayed_observation_rate=delayed_observation_rate,
+            noise_spike_rate=noise_spike_rate,
             smart_states=smart_states,
             scenario_state=scenario_state,
+            lag_reference_matrices=lag_history[-MAX_OBSERVATION_LAG:],
         )
+        lag_history.append(latency_matrix.copy())
+        if len(lag_history) > (MAX_OBSERVATION_LAG + 1):
+            lag_history.pop(0)
         peer_graph = _build_peer_graph(
             nodes=nodes,
             latency_matrix=latency_matrix,
@@ -990,11 +1414,24 @@ def build_network_simulation(
                 model=model_for_adaptation,
                 feature_columns=feature_columns,
             )
+            blended_scores: Dict[int, float] = {}
+            for node_id, score in fraud_scores.items():
+                previous = float(delayed_scores.get(node_id, score))
+                blended = DELAYED_SIGNAL_MIX * previous + (1.0 - DELAYED_SIGNAL_MIX) * float(score)
+                blended_scores[int(node_id)] = float(np.clip(blended, 0.0, 1.0))
+            fraud_scores = blended_scores
+            delayed_scores = dict(blended_scores)
             node_region_map = {node.node_id: node.region for node in nodes}
             node_label_map = {node.node_id: node.label for node in nodes}
+            prioritized_node_ids = defender_policy.prioritize_nodes_for_investigation(
+                fraud_scores=fraud_scores,
+                uncertainty_scores=uncertainty_scores,
+                node_regions=node_region_map,
+            )
             effective_pred = []
             y_true = []
-            for node_id, score in fraud_scores.items():
+            for node_id in prioritized_node_ids:
+                score = float(fraud_scores.get(node_id, 0.0))
                 uncertainty = float(uncertainty_scores.get(node_id, 0.0))
                 label = node_label_map.get(node_id, "honest")
                 region = node_region_map.get(node_id, "unknown")
@@ -1042,6 +1479,7 @@ def build_network_simulation(
         if smart_states and timestep < time_steps - 1:
             _update_smart_attacker_states(
                 smart_states=smart_states,
+                campaigns=campaigns,
                 fraud_scores=fraud_scores,
                 uncertainty_scores=uncertainty_scores,
                 model_df=model_df,
@@ -1053,7 +1491,41 @@ def build_network_simulation(
                 total_timesteps=time_steps,
                 adaptation_base=adaptation_base,
                 adaptation_growth=adaptation_growth,
+                suboptimal_action_rate=suboptimal_action_rate,
+                decision_epsilon=decision_epsilon,
+                feedback_noise_std=feedback_noise_std,
+                feedback_delay_steps=feedback_delay_steps,
                 rng=rng,
+            )
+            strategy_rewards = _strategy_rewards_from_states(
+                smart_states=smart_states,
+                threshold=defender_policy.current_threshold,
+            )
+            learning_state = update_learning_state(learning_state, strategy_rewards=strategy_rewards)
+            for state in smart_states.values():
+                if rng.random() < strategy_mutation_rate:
+                    new_strategy = str(rng.choice(SMART_ATTACKER_STRATEGY_ARRAY))
+                    state["strategy"] = new_strategy
+                    state["is_emergent_strategy"] = True
+                if rng.random() < STRATEGY_RESAMPLING_RATE:
+                    sampled_strategy = str(
+                        rng.choice(
+                            SMART_ATTACKER_STRATEGY_ARRAY,
+                            p=np.array(
+                                [learning_state.strategy_mix.get(name, 0.0) for name in SMART_ATTACKER_STRATEGIES],
+                                dtype=float,
+                            ),
+                        )
+                    )
+                    state["strategy"] = sampled_strategy
+            effective_strategy_mix = evolve_strategy_mix(
+                current_mix=learning_state.strategy_mix,
+                mutation_rate=strategy_mutation_rate,
+                rng=rng,
+            )
+            learning_state.strategy_mix = dict(effective_strategy_mix)
+            strategy_dominance_over_time.append(
+                float(max(learning_state.strategy_mix.values()) if learning_state.strategy_mix else 0.0)
             )
 
     final_snapshot = snapshots[-1]
@@ -1075,6 +1547,7 @@ def build_network_simulation(
         total_resets = 0
         total_post_reset_detections = 0
         avg_reward = 0.0
+    warmup_values = [int(state.get("warmup_steps", 1)) for state in smart_states.values()]
     defender_summary = summarize_defender_metrics(defender_policy, current_timestep=time_steps - 1)
     scenario_metrics: Dict[str, float] = {
         **event_counts,
@@ -1086,7 +1559,35 @@ def build_network_simulation(
         "identity_reset_frequency": float(total_resets / max(len(smart_states), 1)),
         "post_reset_detection_count": float(total_post_reset_detections),
         "avg_smart_attacker_cumulative_reward": avg_reward,
+        "gray_zone_node_count": float(sum(1 for n in nodes if n.gray_zone)),
+        "ambiguity_anchor_count": float(sum(1 for n in nodes if n.ambiguity_anchor)),
+        "avg_attacker_warmup_steps": float(np.mean(warmup_values) if warmup_values else 0.0),
+        "noise_level": noise_level,
+        "attacker_sophistication": attacker_sophistication,
+        "visibility_level": visibility_level,
+        "label_noise_rate": label_noise_rate,
+        "difficulty_level": float(Difficulties.index(normalized_difficulty_level)),
+        "partial_label_rate": partial_label_rate,
+        "delayed_label_steps": float(delayed_label_steps),
+        "suboptimal_action_rate": suboptimal_action_rate,
+        "decision_epsilon": decision_epsilon,
+        "feedback_noise_std": feedback_noise_std,
+        "feedback_delay_steps": float(feedback_delay_steps),
+        "strategy_mutation_rate": strategy_mutation_rate,
+        "strategy_dominance_score": float(max(learning_state.strategy_mix.values()) if learning_state.strategy_mix else 0.0),
+        "strategy_dominance_over_time": float(np.mean(strategy_dominance_over_time) if strategy_dominance_over_time else 0.0),
+        "campaign_count": float(len(campaigns)),
+        "leader_count": float(sum(1 for state in smart_states.values() if state.get("campaign_role") == "leader")),
+        "decoy_count": float(sum(1 for state in smart_states.values() if state.get("campaign_role") == "decoy")),
+        "executor_count": float(sum(1 for state in smart_states.values() if state.get("campaign_role") == "executor")),
+        "measurement_error_std_effective": measurement_error_std,
+        "missing_latency_rate_effective": missing_latency_rate,
+        "packet_loss_rate_effective": packet_loss_rate,
+        "partial_visibility_rate_effective": partial_visibility_rate,
+        "seed": float(seed),
     }
+    for strategy_name, weight in learning_state.strategy_mix.items():
+        scenario_metrics[f"strategy_mix_{strategy_name}"] = float(weight)
     return SimulationResult(
         nodes=nodes,
         latency_matrix=final_snapshot.latency_matrix,

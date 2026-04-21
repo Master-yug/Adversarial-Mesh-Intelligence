@@ -41,6 +41,7 @@ def compute_detection_metrics(
     node_rows = []
     fp_rows = []
     detected_attackers_within_n = 0
+    detected_attackers_within_2 = 0
     total_attackers = sum(1 for label in node_labels.values() if label != "honest")
     detection_delays = []
 
@@ -67,6 +68,8 @@ def compute_detection_metrics(
             detection_delays.append(float(detection_delay))
             if was_detected and first_detection <= within_steps:
                 detected_attackers_within_n += 1
+            if was_detected and first_detection <= 2:
+                detected_attackers_within_2 += 1
 
         node_rows.append(
             {
@@ -86,7 +89,9 @@ def compute_detection_metrics(
 
     summary = {
         "avg_detection_delay": avg_detection_delay,
+        "median_detection_delay": float(pd.Series(detection_delays).median() if detection_delays else 0.0),
         f"pct_attackers_detected_within_{within_steps}_steps": pct_detected_within_n,
+        "early_detection_rate_within_2_steps": float(100.0 * detected_attackers_within_2 / max(total_attackers, 1)),
         "avg_false_positives_over_time": float(false_positives_over_time["false_positives"].mean()),
     }
     if high_value_regions:
@@ -111,3 +116,42 @@ def compute_detection_metrics(
         summary=summary,
         false_positives_over_time=false_positives_over_time,
     )
+
+
+def compute_system_cost_metrics(
+    per_node: pd.DataFrame,
+    false_positives_over_time: pd.DataFrame,
+    cost_of_false_positive: float = 1.0,
+    cost_of_false_negative: float = 8.0,
+    detection_latency_penalty: float = 2.5,
+    economic_loss_due_to_delay: float = 1.8,
+) -> Dict[str, float]:
+    """Compute product-oriented system cost metrics for model selection and reporting."""
+    if per_node.empty:
+        return {
+            "cost_of_false_positive": 0.0,
+            "cost_of_false_negative": 0.0,
+            "detection_latency_penalty": 0.0,
+            "economic_loss_due_to_delay": 0.0,
+            "total_system_cost": 0.0,
+        }
+    honest_mask = per_node["label_name"] == "honest"
+    attacker_mask = ~honest_mask
+    false_positive_count = int((honest_mask & per_node["was_detected"].astype(bool)).sum())
+    false_negative_count = int((attacker_mask & (~per_node["was_detected"].astype(bool))).sum())
+    avg_delay = float(pd.to_numeric(per_node.loc[attacker_mask, "detection_delay"], errors="coerce").fillna(0.0).mean())
+    fp_cost = float(cost_of_false_positive * false_positive_count)
+    fn_cost = float(cost_of_false_negative * false_negative_count)
+    latency_cost = float(detection_latency_penalty * avg_delay)
+    delayed_economic_loss = float(economic_loss_due_to_delay * avg_delay * max(int(attacker_mask.sum()), 1))
+    total = fp_cost + fn_cost + latency_cost + delayed_economic_loss
+    return {
+        "cost_of_false_positive": fp_cost,
+        "cost_of_false_negative": fn_cost,
+        "detection_latency_penalty": latency_cost,
+        "economic_loss_due_to_delay": delayed_economic_loss,
+        "avg_false_positives_over_time": float(false_positives_over_time["false_positives"].mean())
+        if not false_positives_over_time.empty
+        else 0.0,
+        "total_system_cost": float(total),
+    }
