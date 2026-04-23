@@ -16,6 +16,11 @@ def main() -> None:
     parser.add_argument("--nodes", type=int, default=220)
     parser.add_argument("--steps", type=int, default=18)
     parser.add_argument("--rounds", type=int, default=4)
+    parser.add_argument("--output-dir", type=str, default="closed_loop_plots")
+    parser.add_argument("--uncertainty", type=float, default=0.08)
+    parser.add_argument("--inner-iterations", type=int, default=3)
+    parser.add_argument("--inner-epsilon", type=float, default=0.01, help="Convergence epsilon for inner best-response loop")
+    parser.add_argument("--memory-decay", type=float, default=0.90, help="Exponential decay rate applied to warm-start memory")
     args = parser.parse_args()
 
     if args.command == "run_simulation":
@@ -30,11 +35,29 @@ def main() -> None:
         return
 
     if args.command == "run_closed_loop":
-        result = run_closed_loop(iterations=args.rounds, seed=args.seed, total_nodes=args.nodes, time_steps=args.steps)
+        result = run_closed_loop(
+            iterations=args.rounds,
+            seed=args.seed,
+            total_nodes=args.nodes,
+            time_steps=args.steps,
+            output_dir=args.output_dir,
+            uncertainty_level=args.uncertainty,
+            inner_iterations=args.inner_iterations,
+            inner_convergence_epsilon=args.inner_epsilon,
+            memory_decay_rate=args.memory_decay,
+        )
         print({
             "rounds": [r.__dict__ for r in result.iterations],
             "final_metrics": result.final_model.metrics,
             "benchmark": result.benchmark.to_dict(orient="records"),
+            "equilibrium_detected": bool(result.iterations[-1].equilibrium_detected) if result.iterations else False,
+            "equilibrium_type": str(result.system_analysis.get("equilibrium_type", "insufficient_data")),
+            "convergence_time": int(result.system_analysis.get("convergence_time", -1)),
+            "behavior_pattern": str(result.system_analysis.get("behavior_pattern", "insufficient_data")),
+            "dominant_strategies": result.system_analysis.get("dominant_strategies", {}),
+            "system_efficiency": float(result.system_analysis.get("system_efficiency", 0.0)),
+            "system_analysis": result.system_analysis,
+            "plots_output_dir": args.output_dir,
         })
         return
 

@@ -3,3 +3,6 @@ __pycache__/
 model.pkl
 network.png
 demo_output/
+strategic_memory.json
+memory/*.json
+closed_loop_plots/
