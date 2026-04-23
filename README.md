@@ -1,4 +1,4 @@
-# antispoof
+# Adversarial-Mesh-Intelligence
 
 Adversarial decentralized-network anti-spoofing simulation, ML detection, evaluation, and online scoring API.
 
