@@ -14,6 +14,7 @@ from .visualization import (
     plot_reward_distribution,
     plot_roc_curve,
     plot_strategy_distribution_over_time,
+    plot_strategy_stacked_area,
 )
 
 __all__ = [
@@ -31,6 +32,7 @@ __all__ = [
     "plot_detection_over_time",
     "plot_reward_distribution",
     "plot_strategy_distribution_over_time",
+    "plot_strategy_stacked_area",
     "plot_defender_threshold_over_time",
     "plot_equilibrium_detection",
     "plot_cost_vs_time",

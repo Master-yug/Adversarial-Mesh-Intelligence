@@ -24,7 +24,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import matplotlib
 matplotlib.use("Agg")  # non-interactive backend — must come before pyplot
@@ -48,6 +48,7 @@ from evaluation.visualization import (
     plot_equilibrium_detection,
     plot_fraud_leakage_vs_time,
     plot_strategy_distribution_over_time,
+    plot_strategy_stacked_area,
 )
 from features import extract_node_features
 from simulation import build_network_simulation
@@ -178,6 +179,8 @@ def _parse_args() -> argparse.Namespace:
                         help="Directory for plots and report (default: demo_output)")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI colour output")
     parser.add_argument("--quiet",    action="store_true", help="Suppress narrative; print only metrics")
+    parser.add_argument("--no-baseline", action="store_true",
+                        help="Skip the baseline (no-defender) simulation; use estimated values instead")
     return parser.parse_args()
 
 
@@ -282,7 +285,8 @@ def _defender_narrative(prev: float, curr: float, eq: bool) -> str:
     return _c(f"🛡  Defender adjusts threshold to {curr:.3f}.", BLUE)
 
 
-def _print_step_narrative(step: int, iteration: ClosedLoopIteration, prev_threshold: float) -> None:
+def _print_step_narrative(step: int, iteration: ClosedLoopIteration, prev_threshold: float,
+                          prev_leakage: float = 0.0) -> None:
     leakage     = float(iteration.metrics.get("fraud_leakage_pct", 0.0))
     system_cost = float(iteration.metrics.get("total_system_cost", 0.0))
     flagged     = len(iteration.selected_nodes)
@@ -293,8 +297,23 @@ def _print_step_narrative(step: int, iteration: ClosedLoopIteration, prev_thresh
     _event(step, _strategy_narrative(iteration.selected_attacker_strategy), RED)
     _event(step, _defender_narrative(prev_threshold, iteration.defender_threshold, eq), BLUE)
 
+    # ── Key moment detection ──────────────────────────────────────────────────
+    leakage_delta = leakage - prev_leakage
+    if step > 1 and leakage_delta > 15:
+        _event(step, _c(f"⚠️  Attack surge detected — fraud leakage jumped +{leakage_delta:.1f}%!", RED + BOLD))
+    if step > 1 and leakage_delta < -10:
+        _event(step, _c(f"✅ System stabilizing — fraud leakage dropped {abs(leakage_delta):.1f}%.", GREEN))
+
+    dominant = max(iteration.attacker_strategy_mix.items(), key=lambda x: x[1], default=("none", 0))
+    if dominant[0] in ("low_and_slow", "slow_drift", "camouflage") and dominant[1] > 0.35:
+        _event(step, _c(f"🕵️  Attackers switching to stealth strategy: {STRATEGY_DISPLAY.get(dominant[0], dominant[0])}", YELLOW))
+
+    threshold_delta = iteration.defender_threshold - prev_threshold
+    if threshold_delta > 0.03:
+        _event(step, _c(f"🛡️  Defender tightening controls ({prev_threshold:.3f} → {iteration.defender_threshold:.3f})", BLUE + BOLD))
+
     if leakage > 40:
-        _event(step, _c(f"⚠️  Fraud leakage CRITICAL at {leakage:.1f}%!", RED))
+        _event(step, _c(f"🔥 Fraud spike detected — leakage at {leakage:.1f}%!", RED + BOLD))
     elif leakage < 5:
         _event(step, _c(f"✅ Fraud leakage very low: {leakage:.1f}%", GREEN))
 
@@ -372,22 +391,122 @@ def _print_explainability(
     print()
 
 
+# ── Story Mode Narrative ───────────────────────────────────────────────────────
+def _print_story_beginning(scenario_label: str, nodes: int, iterations: int) -> None:
+    _section("⚔  ACT I — THE BATTLEFIELD IS SET")
+    print(f"  {_c('A decentralised network of', DIM)} {_c(str(nodes), BOLD + CYAN)} {_c('nodes goes live.', DIM)}")
+    print(f"  {_c('Scenario:', DIM)} {_c(scenario_label, BOLD + CYAN)}")
+    print()
+    print(f"  {_c('🔴 Attackers', RED + BOLD)} flood the network, probing for weak points.")
+    print(f"  {_c('🔵 Defender', BLUE + BOLD)} stands guard — adaptive, learning, fighting back.")
+    print(f"  {_c('The battle will unfold across', DIM)} {_c(str(iterations), BOLD)} {_c('rounds.', DIM)}")
+    print()
+    print(f"  {_c('Will the system hold?  Watch and find out.', BOLD + YELLOW)}")
+    print()
+
+
+def _print_story_middle() -> None:
+    _section("⚡ ACT II — THE ARMS RACE INTENSIFIES")
+    print(f"  {_c('Attackers have studied the defender.', DIM)}")
+    print(f"  {_c('New strategies emerge — camouflage, slow drift, coordinated clusters.', YELLOW)}")
+    print()
+    print(f"  {_c('🕵️  The battlefield shifts.', BOLD + YELLOW)} Attackers adapt.  Defender learns.")
+    print(f"  {_c('Every round is a move in an invisible chess match.', DIM)}")
+    print()
+
+
+def _print_story_climax(rounds: List[ClosedLoopIteration]) -> None:
+    _section("🔥 ACT III — THE CRITICAL MOMENT")
+    if len(rounds) >= 2:
+        last_leakage = float(rounds[-1].metrics.get("fraud_leakage_pct", 0.0))
+        prev_leakage = float(rounds[-2].metrics.get("fraud_leakage_pct", 0.0))
+        if last_leakage > prev_leakage + 5:
+            print(f"  {_c('Fraud leakage is RISING.', RED + BOLD)} The defender is under pressure.")
+            print(f"  {_c('⚠️  Attack intensity peaks — can the system hold the line?', RED)}")
+        elif last_leakage < prev_leakage - 5:
+            print(f"  {_c('The tide is turning.', GREEN + BOLD)} Fraud leakage is falling.")
+            print(f"  {_c('The defender adaptive strategy begins to pay off.', GREEN)}")
+        else:
+            print(f"  {_c('The battle reaches peak intensity.', BOLD + YELLOW)}")
+            print(f"  {_c('Both sides locked in a tense standoff.', YELLOW)}")
+    else:
+        print(f"  {_c('The battle reaches its decisive phase.', BOLD + YELLOW)}")
+    print()
+
+
+def _print_story_end(eq_reached: bool, eq_type: str, prevented_pct: float) -> None:
+    _section("🏁 EPILOGUE — THE DUST SETTLES")
+    if eq_reached:
+        print(f"  {_c('After fierce combat, the system reached', BOLD)} {_c(eq_type.replace('_', ' ').upper(), BOLD + GREEN)}")
+        print(f"  {_c('Attacker and defender locked into stable strategies.', GREEN)}")
+    else:
+        print(f"  {_c('The battle continues beyond this window.', BOLD + YELLOW)}")
+        print(f"  {_c('No equilibrium reached — the arms race is ongoing.', YELLOW)}")
+    print()
+    print(f"  {_c(f'🛡  System prevented approximately {prevented_pct:.1f}% of potential fraud losses.', GREEN + BOLD)}")
+    print()
+
+
+# ── Baseline simulation (no-defender) ─────────────────────────────────────────
+def _run_baseline_simulation(
+    nodes: int,
+    seed: int,
+    schedule: List[str],
+    quiet: bool = False,
+) -> Optional[float]:
+    """Run a 1-step simulation with a passive defender (threshold=0.999) to
+    establish the true 'without defender' fraud-leakage baseline.
+    Returns the baseline fraud-leakage percentage, or None on failure."""
+    if not quiet:
+        print(f"  {_c('Running baseline (no-defender) simulation…', DIM)}", flush=True)
+    try:
+        baseline_env = AdversarialFraudEnvironment(
+            iterations=1,
+            seed=seed + 9999,
+            total_nodes=nodes,
+            time_steps=16,
+            attacker_memory_path=Path("/tmp/antispoof_baseline_attacker.json"),
+            defender_memory_path=Path("/tmp/antispoof_baseline_defender.json"),
+            scenario_schedule=schedule[:1],
+        )
+        passive_attacker = AttackerAgent(temperature=0.25, epsilon=0.08, use_ucb_selection=True)
+        # threshold=0.999 ensures no node is ever selected (fraud scores < 1.0)
+        passive_defender = DefenderAgent(threshold=0.999, budget_ratio=0.0, min_budget=0)
+        outcome = baseline_env.step(
+            iteration=0,
+            attacker_agent=passive_attacker,
+            defender_agent=passive_defender,
+        )
+        return float(outcome.result.metrics.get("fraud_leakage_pct", 50.0))
+    except Exception:  # baseline is informational — never block the demo
+        return None
+
+
 # ── Before / After ─────────────────────────────────────────────────────────────
 def _print_before_after(
     mean_leakage: float,
     system_efficiency: float,
     fraud_prevented_pct: float,
+    baseline_leakage: Optional[float] = None,
 ) -> None:
     _section("BEFORE vs AFTER — FRAUD PREVENTION IMPACT")
 
-    # Estimate unchecked leakage: if the defender were absent, leakage
-    # would approach the attacker's raw effectiveness (approximated here).
-    estimated_without = min(100.0, mean_leakage + fraud_prevented_pct * 0.85)
-    estimated_without = max(estimated_without, mean_leakage + 5.0)
+    if baseline_leakage is not None:
+        # True two-simulation comparison
+        without = float(baseline_leakage)
+        actual_prevented = max(0.0, without - mean_leakage)
+        prevented_pct = min(100.0, actual_prevented / max(without, 1e-9) * 100.0)
+        source_label = "(actual no-defender simulation)"
+    else:
+        # Estimated fallback
+        without = min(100.0, mean_leakage + fraud_prevented_pct * 0.85)
+        without = max(without, mean_leakage + 5.0)
+        prevented_pct = min(100.0, max(0.0, fraud_prevented_pct))
+        source_label = "(estimated)"
 
     print()
-    print(f"  {_c('WITHOUT Anti-Spoofing System:', BOLD + RED)}")
-    print(f"    Estimated fraud leakage:  {_c(f'{estimated_without:.1f}%', RED)}  {_c(_bar(estimated_without / 100.0), RED)}")
+    print(f"  {_c('WITHOUT Anti-Spoofing System:', BOLD + RED)}  {_c(source_label, DIM)}")
+    print(f"    Estimated fraud leakage:  {_c(f'{without:.1f}%', RED)}  {_c(_bar(without / 100.0), RED)}")
     print(f"    Attackers act freely — fraudulent rewards extracted at scale.")
     print()
     print(f"  {_c('WITH Anti-Spoofing System:', BOLD + GREEN)}")
@@ -395,8 +514,7 @@ def _print_before_after(
     print(f"    System efficiency:        {_c(f'{system_efficiency:.2%}', GREEN)}")
     print()
 
-    prevented = min(100.0, max(0.0, fraud_prevented_pct))
-    print(f"  {_c('▶', BOLD + GREEN)} System prevented {_c(f'{prevented:.1f}%', BOLD + GREEN)} of fraud losses.")
+    print(f"  {_c('▶', BOLD + GREEN)} System prevented {_c(f'{prevented_pct:.1f}%', BOLD + GREEN)} of fraud losses.")
     print(f"  {_c('▶', BOLD + GREEN)} Equivalent to eliminating the majority of fraudulent reward leakage.")
     print()
 
@@ -412,6 +530,7 @@ def _generate_visualizations(
     history: Dict,
     output_dir: Path,
     scenario_label: str,
+    baseline_leakage: Optional[float] = None,
 ) -> List[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     saved: List[Path] = []
@@ -426,9 +545,13 @@ def _generate_visualizations(
 
     plt.style.use("seaborn-v0_8-whitegrid")
 
-    # 1. Fraud leakage over time
+    # 1. Fraud leakage over time (with optional baseline reference line)
     if leakage_hist:
-        fig, ax = plot_fraud_leakage_vs_time(leakage_hist, output_path=None)
+        fig, ax = plot_fraud_leakage_vs_time(
+            leakage_hist,
+            baseline_leakage=baseline_leakage,
+            output_path=None,
+        )
         ax.set_title(f"Fraud Leakage Over Time\n{scenario_label}", fontsize=13, fontweight="bold")
         p = output_dir / "fraud_leakage_over_time.png"
         _save_plot(fig, p)
@@ -442,7 +565,15 @@ def _generate_visualizations(
         _save_plot(fig, p)
         saved.append(p)
 
-    # 3. Attacker strategy distribution
+    # 3. Attacker strategy distribution — stacked area (primary)
+    if strategy_hist:
+        fig, ax = plot_strategy_stacked_area(strategy_hist, output_path=None)
+        ax.set_title(f"Attacker Strategy Evolution\n{scenario_label}", fontsize=13, fontweight="bold")
+        p = output_dir / "attacker_strategy_stacked_area.png"
+        _save_plot(fig, p)
+        saved.append(p)
+
+    # 4. Attacker strategy distribution — line chart (secondary)
     if strategy_hist:
         fig, ax = plot_strategy_distribution_over_time(strategy_hist, output_path=None)
         ax.set_title(f"Attacker Strategy Distribution\n{scenario_label}", fontsize=13, fontweight="bold")
@@ -450,7 +581,7 @@ def _generate_visualizations(
         _save_plot(fig, p)
         saved.append(p)
 
-    # 4. Defender threshold over time
+    # 5. Defender threshold over time
     if threshold_hist:
         fig, ax = plot_defender_threshold_over_time(threshold_hist, output_path=None)
         ax.set_title(f"Defender Policy (Threshold) Over Time\n{scenario_label}", fontsize=13, fontweight="bold")
@@ -458,7 +589,7 @@ def _generate_visualizations(
         _save_plot(fig, p)
         saved.append(p)
 
-    # 5. Equilibrium detection
+    # 6. Equilibrium detection
     if eq_hist and eq_sd and eq_cd:
         fig, _ = plot_equilibrium_detection(eq_hist, eq_sd, eq_cd, output_path=None)
         fig.suptitle(f"Equilibrium Detection Dynamics\n{scenario_label}", fontsize=13, fontweight="bold")
@@ -466,17 +597,23 @@ def _generate_visualizations(
         _save_plot(fig, p)
         saved.append(p)
 
-    # 6. Before vs After bar chart
-    if leakage_hist and len(leakage_hist) >= 2:
-        n = len(leakage_hist)
-        third = max(1, n // 3)
-        early = float(np.mean(leakage_hist[:third]))
-        late  = float(np.mean(leakage_hist[-third:]))
+    # 7. Before vs After bar chart (with/without defender)
+    if leakage_hist and len(leakage_hist) >= 1:
+        if baseline_leakage is not None:
+            without_val = float(baseline_leakage)
+            with_val    = float(np.mean(leakage_hist))
+            labels_ba   = ["Without Defender\n(Baseline)", "With Defender\n(This Run)"]
+        else:
+            n = len(leakage_hist)
+            third = max(1, n // 3)
+            without_val = float(np.mean(leakage_hist[:third]))
+            with_val    = float(np.mean(leakage_hist[-third:]))
+            labels_ba   = ["Early (No Adaptation)", "Late (With Adaptation)"]
 
         fig, ax = plt.subplots(figsize=(8, 5))
         bars = ax.bar(
-            ["Early (No Adaptation)", "Late (With Adaptation)"],
-            [early, late],
+            labels_ba,
+            [without_val, with_val],
             color=["#ef4444", "#22c55e"],
             width=0.45,
             edgecolor="white",
@@ -484,9 +621,12 @@ def _generate_visualizations(
         )
         ax.bar_label(bars, fmt="%.1f%%", padding=4, fontsize=12, fontweight="bold")
         ax.set_ylabel("Fraud Leakage (%)", fontsize=11)
-        ax.set_ylim(0, max(early, late) * 1.4 + 5)
+        ax.set_ylim(0, max(without_val, with_val) * 1.4 + 5)
+        reduction = max(0.0, without_val - with_val)
+        prevented_pct = min(100.0, reduction / max(without_val, 1e-9) * 100.0)
         ax.set_title(
-            f"Before vs After — Fraud Reduction\n{scenario_label}",
+            f"Before vs After — Fraud Reduction\n{scenario_label}\n"
+            f"System prevented {prevented_pct:.1f}% of fraud",
             fontsize=13,
             fontweight="bold",
         )
@@ -505,6 +645,7 @@ def _print_final_report(
     saved_plots: List[Path],
     elapsed: float,
     output_dir: Path,
+    baseline_leakage: Optional[float] = None,
 ) -> None:
     _banner("FINAL REPORT", f"Scenario: {scenario_label}")
 
@@ -512,10 +653,15 @@ def _print_final_report(
     eq_type       = str(system_analysis.get("equilibrium_type", "unknown"))
     dominant      = str(system_analysis.get("dominant_strategy", "unknown"))
     dominance     = float(system_analysis.get("dominance_share", 0.0))
-    prevented_pct = float(system_analysis.get("fraud_prevented_pct", 0.0))
     efficiency    = float(system_analysis.get("system_efficiency", 0.0))
     mean_cost     = float(system_analysis.get("mean_system_cost", 0.0))
     mean_leakage  = float(system_analysis.get("mean_fraud_leakage_pct", 0.0))
+
+    if baseline_leakage is not None:
+        reduction       = max(0.0, float(baseline_leakage) - mean_leakage)
+        prevented_pct   = min(100.0, reduction / max(float(baseline_leakage), 1e-9) * 100.0)
+    else:
+        prevented_pct = float(system_analysis.get("fraud_prevented_pct", 0.0))
 
     # Count strategy usage across all rounds
     strategy_counts: Dict[str, int] = {}
@@ -540,6 +686,8 @@ def _print_final_report(
     print()
     _metric("Total Fraud Prevented",  f"{prevented_pct:.1f}%",      GREEN)
     _metric("Mean Fraud Leakage",     f"{mean_leakage:.1f}%",       YELLOW if mean_leakage > 10 else GREEN)
+    if baseline_leakage is not None:
+        _metric("Baseline (No Defender)", f"{baseline_leakage:.1f}%", RED)
     _metric("System Efficiency",      f"{efficiency:.2%}",           GREEN if efficiency > 0.005 else YELLOW)
     _metric("Mean System Cost",       f"{mean_cost:.2f}",            YELLOW if mean_cost > 100 else GREEN)
     _metric("Iterations Run",         str(len(rounds)))
@@ -552,6 +700,17 @@ def _print_final_report(
         print(f"  {_c('⚠', BOLD + YELLOW)} System did NOT stabilise — the battle continues beyond this window.")
 
     print(f"  {_c('★', BOLD + GREEN)} System eliminated ~{_c(f'{prevented_pct:.1f}%', BOLD + GREEN)} of potential fraud losses.")
+    print()
+
+    print(f"\n  {_c(SEP2, BOLD + CYAN)}")
+    print(f"  {_c('  📊  SYSTEM EFFICIENCY DASHBOARD', BOLD + CYAN)}")
+    print(f"  {_c(SEP2, BOLD + CYAN)}")
+    eff_bar  = _bar(min(efficiency * 10, 1.0))
+    leak_bar = _bar(mean_leakage / 100.0)
+    prev_bar = _bar(prevented_pct / 100.0)
+    print(f"  {'Efficiency':<26} {_c(eff_bar, GREEN)}  {efficiency:.2%}")
+    print(f"  {'Fraud Leakage':<26} {_c(leak_bar, RED if mean_leakage > 20 else YELLOW)}  {mean_leakage:.1f}%")
+    print(f"  {'Fraud Prevented':<26} {_c(prev_bar, GREEN)}  {prevented_pct:.1f}%")
     print()
 
     if saved_plots:
@@ -598,6 +757,22 @@ def main() -> None:
     print(f"  {_c('Output:', DIM):<22} {output_dir}")
     print()
 
+    # ── Baseline (no-defender) simulation ─────────────────────────────────────
+    baseline_leakage: Optional[float] = None
+    if not args.no_baseline:
+        _section("ESTABLISHING BASELINE — NO DEFENDER")
+        baseline_leakage = _run_baseline_simulation(
+            nodes=args.nodes,
+            seed=args.seed,
+            schedule=schedule,
+            quiet=args.quiet,
+        )
+        if baseline_leakage is not None:
+            print(f"  {_c('✔', GREEN)} Baseline fraud leakage (no defender): {_c(f'{baseline_leakage:.1f}%', RED + BOLD)}")
+        else:
+            print(f"  {_c('⚠', YELLOW)} Baseline simulation failed — will use estimated values.")
+        print()
+
     # ── Initialise agents and environment ──────────────────────────────────────
     memory_dir = output_dir / "memory"
     environment = AdversarialFraudEnvironment(
@@ -614,6 +789,10 @@ def main() -> None:
     attacker = AttackerAgent(temperature=0.25, epsilon=0.08, use_ucb_selection=True)
     defender = DefenderAgent(threshold=0.5, budget_ratio=0.07, min_budget=3)
 
+    # ── Story Act I — Beginning ────────────────────────────────────────────────
+    if not args.quiet:
+        _print_story_beginning(scenario_cfg["label"], args.nodes, iterations)
+
     _section("THE BATTLE BEGINS")
     print(f"  {_c('Initialising', DIM)} {args.nodes} nodes · {iterations} rounds")
     print(f"  {_c('Attacker', RED)} starts with equal probability across {len(STRATEGY_MARKETPLACE)} strategies.")
@@ -623,21 +802,34 @@ def main() -> None:
     # ── Step-by-step simulation loop ───────────────────────────────────────────
     rounds: List[ClosedLoopIteration] = []
     prev_threshold = defender.threshold
+    prev_leakage   = 0.0
     start_time = time.perf_counter()
+    middle_printed = False
+    climax_printed = False
 
     for i in range(iterations):
         step = i + 1
         print(f"\n{_c(f'  ── ROUND {step}/{iterations} ──', BOLD + DIM)}", end="", flush=True)
+
+        # Story Acts: print Middle at ~33% and Climax at ~67%
+        progress = float(i) / max(iterations - 1, 1)
+        if not args.quiet and not middle_printed and progress >= 0.33 and iterations > 2:
+            _print_story_middle()
+            middle_printed = True
+        if not args.quiet and not climax_printed and progress >= 0.67 and iterations > 3:
+            _print_story_climax(rounds)
+            climax_printed = True
 
         outcome = environment.step(iteration=i, attacker_agent=attacker, defender_agent=defender)
         it = outcome.result
         rounds.append(it)
 
         if not args.quiet:
-            _print_step_narrative(step, it, prev_threshold)
+            _print_step_narrative(step, it, prev_threshold, prev_leakage)
         _print_live_dashboard(step, it)
 
         prev_threshold = it.defender_threshold
+        prev_leakage   = float(it.metrics.get("fraud_leakage_pct", 0.0))
 
     elapsed = time.perf_counter() - start_time
 
@@ -667,12 +859,25 @@ def main() -> None:
     # ── System analysis ────────────────────────────────────────────────────────
     system_analysis = analyze_system_dynamics(environment.history, rounds=rounds)
 
+    # ── Story Act: End ─────────────────────────────────────────────────────────
+    if not args.quiet:
+        eq_reached = bool(system_analysis.get("equilibrium_reached", False))
+        eq_type    = str(system_analysis.get("equilibrium_type", "unknown"))
+        if baseline_leakage is not None:
+            mean_leakage = float(system_analysis.get("mean_fraud_leakage_pct", 0.0))
+            reduction    = max(0.0, float(baseline_leakage) - mean_leakage)
+            prevented    = min(100.0, reduction / max(float(baseline_leakage), 1e-9) * 100.0)
+        else:
+            prevented = float(system_analysis.get("fraud_prevented_pct", 0.0))
+        _print_story_end(eq_reached, eq_type, prevented)
+
     # ── Before / After ─────────────────────────────────────────────────────────
     if not args.quiet:
         _print_before_after(
             mean_leakage=float(system_analysis.get("mean_fraud_leakage_pct", 0.0)),
             system_efficiency=float(system_analysis.get("system_efficiency", 0.0)),
             fraud_prevented_pct=float(system_analysis.get("fraud_prevented_pct", 0.0)),
+            baseline_leakage=baseline_leakage,
         )
 
     # ── Visualizations ─────────────────────────────────────────────────────────
@@ -681,6 +886,7 @@ def main() -> None:
         history=environment.history,
         output_dir=output_dir,
         scenario_label=scenario_cfg["label"],
+        baseline_leakage=baseline_leakage,
     )
     for p in saved_plots:
         print(f"  {_c('✔', GREEN)} Saved: {p.name}")
@@ -693,6 +899,7 @@ def main() -> None:
         saved_plots=saved_plots,
         elapsed=elapsed,
         output_dir=output_dir,
+        baseline_leakage=baseline_leakage,
     )
 
 

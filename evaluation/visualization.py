@@ -278,15 +278,74 @@ def plot_cost_vs_time(cost_history: list[float], output_path: str | None = None)
     return fig, ax
 
 
-def plot_fraud_leakage_vs_time(fraud_leakage_history: list[float], output_path: str | None = None):
+def plot_fraud_leakage_vs_time(
+    fraud_leakage_history: list[float],
+    baseline_leakage: float | None = None,
+    output_path: str | None = None,
+):
     plt.style.use("seaborn-v0_8-whitegrid")
     fig, ax = plt.subplots(figsize=(10, 6))
     x = np.arange(len(fraud_leakage_history))
     y = np.array(fraud_leakage_history, dtype=float) if fraud_leakage_history else np.array([], dtype=float)
-    ax.plot(x, y, marker="o", linewidth=2.2, color="#ea580c")
+    ax.plot(x, y, marker="o", linewidth=2.2, color="#ea580c", label="With Defender")
+    ax.fill_between(x, y, alpha=0.12, color="#ea580c")
+    if baseline_leakage is not None:
+        ax.axhline(
+            float(baseline_leakage),
+            linestyle="--",
+            color="#dc2626",
+            linewidth=1.8,
+            label=f"Without Defender (baseline {baseline_leakage:.1f}%)",
+        )
+        if y.size > 0:
+            ax.fill_between(x, y, float(baseline_leakage), alpha=0.08, color="#22c55e",
+                            label="Fraud prevented")
     ax.set_title("Fraud Leakage vs Time", fontsize=14, fontweight="bold")
     ax.set_xlabel("Iteration")
     ax.set_ylabel("Fraud leakage (%)")
+    ax.legend(loc="upper right", frameon=True)
+    fig.tight_layout()
+    if output_path:
+        fig.savefig(output_path, dpi=220)
+    return fig, ax
+
+
+def plot_strategy_stacked_area(
+    strategy_distribution_history: list[dict[str, float]],
+    output_path: str | None = None,
+):
+    """Stacked area chart showing how attacker strategy mix evolves over time."""
+    plt.style.use("seaborn-v0_8-whitegrid")
+    fig, ax = plt.subplots(figsize=(11, 6))
+    if not strategy_distribution_history:
+        ax.set_title("Attacker Strategy Evolution", fontsize=14, fontweight="bold")
+        fig.tight_layout()
+        if output_path:
+            fig.savefig(output_path, dpi=220)
+        return fig, ax
+
+    strategy_names = sorted({k for row in strategy_distribution_history for k in row.keys()})
+    x = np.arange(len(strategy_distribution_history))
+    ys = np.array(
+        [[float(row.get(name, 0.0)) for name in strategy_names] for row in strategy_distribution_history],
+        dtype=float,
+    )
+    # Normalise rows so they sum to 1 (minor floating-point drift)
+    row_sums = ys.sum(axis=1, keepdims=True)
+    ys = np.where(row_sums > 0, ys / row_sums, ys)
+
+    palette = [
+        "#ef4444", "#f97316", "#eab308", "#22c55e",
+        "#3b82f6", "#8b5cf6", "#ec4899",
+    ]
+    colors = [palette[i % len(palette)] for i in range(len(strategy_names))]
+    ax.stackplot(x, ys.T, labels=strategy_names, colors=colors, alpha=0.85)
+
+    ax.set_title("Attacker Strategy Evolution (Stacked Area)", fontsize=14, fontweight="bold")
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Strategy share")
+    ax.set_ylim(0.0, 1.0)
+    ax.legend(loc="upper right", ncols=2, frameon=True, fontsize=9)
     fig.tight_layout()
     if output_path:
         fig.savefig(output_path, dpi=220)
