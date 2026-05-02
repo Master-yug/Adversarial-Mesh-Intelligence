@@ -164,6 +164,9 @@ class AdaptiveDefenderPolicy(DefenderPolicy):
         sliding_window_steps: int,
         dynamic_threshold: bool = True,
         quarantine_duration: int = 2,
+        action_budget_per_step: int = 12,
+        threshold_exploration_rate: float = 0.08,
+        random_state: int = 42,
     ) -> None:
         self.base_threshold = float(base_threshold)
         self.current_threshold = float(base_threshold)
@@ -171,6 +174,18 @@ class AdaptiveDefenderPolicy(DefenderPolicy):
         self.sliding_window_steps = max(int(sliding_window_steps), 2)
         self.dynamic_threshold = dynamic_threshold
         self.quarantine_duration = max(int(quarantine_duration), 1)
+        self.action_budget_per_step = max(int(action_budget_per_step), 1)
+        self.threshold_exploration_rate = float(np.clip(threshold_exploration_rate, 0.0, 0.5))
+        self._rng = np.random.default_rng(random_state)
+        self.threshold_arms = [
+            float(np.clip(base_threshold - 0.08, 0.2, 0.95)),
+            float(np.clip(base_threshold, 0.2, 0.95)),
+            float(np.clip(base_threshold + 0.08, 0.2, 0.95)),
+        ]
+        self._arm_counts: Dict[float, int] = {arm: 0 for arm in self.threshold_arms}
+        self._arm_mean_reward: Dict[float, float] = {arm: 0.0 for arm in self.threshold_arms}
+        self._arm_mean_reward[float(np.clip(base_threshold, 0.2, 0.95))] = 0.01
+        self._active_threshold_arm = float(self.current_threshold)
 
         self.quarantined_until: Dict[int, int] = {}
         self.trust_scores: Dict[int, float] = {}
@@ -181,6 +196,22 @@ class AdaptiveDefenderPolicy(DefenderPolicy):
         self.degradation_over_time: List[float] = []
         self.performance_vs_adaptive_attackers: List[float] = []
         self.last_auc: float | None = None
+        self._timestep_actions_used: Dict[int, int] = {}
+
+    def prepare_timestep(self, timestep: int) -> None:
+        self._timestep_actions_used[int(timestep)] = 0
+        self._active_threshold_arm = self._select_threshold_arm()
+        self.current_threshold = float(np.clip(self._active_threshold_arm, 0.2, 0.95))
+
+    def _select_threshold_arm(self) -> float:
+        if self._rng.random() < self.threshold_exploration_rate:
+            return float(self._rng.choice(np.array(self.threshold_arms, dtype=float)))
+        return float(
+            max(
+                self.threshold_arms,
+                key=lambda arm: (self._arm_mean_reward.get(arm, 0.0), -self._arm_counts.get(arm, 0)),
+            )
+        )
 
     def register_nodes(self, node_ids: Iterable[int]) -> None:
         for node_id in node_ids:
@@ -211,6 +242,8 @@ class AdaptiveDefenderPolicy(DefenderPolicy):
     ) -> bool:
         eff_threshold = self.effective_threshold(node_id=node_id, region=region, uncertainty=uncertainty)
         flagged = float(fraud_score) >= eff_threshold
+        if flagged and not self._consume_budget_if_available(timestep):
+            flagged = False
 
         trust = float(self.trust_scores.get(node_id, 1.0))
         rep = float(self.reputation_scores.get(node_id, 1.0))
@@ -231,6 +264,30 @@ class AdaptiveDefenderPolicy(DefenderPolicy):
         self.trust_scores[node_id] = trust
         self.reputation_scores[node_id] = rep
         return flagged
+
+    def _consume_budget_if_available(self, timestep: int) -> bool:
+        used = int(self._timestep_actions_used.get(int(timestep), 0))
+        if used >= self.action_budget_per_step:
+            return False
+        self._timestep_actions_used[int(timestep)] = used + 1
+        return True
+
+    def prioritize_nodes_for_investigation(
+        self,
+        fraud_scores: Dict[int, float],
+        uncertainty_scores: Dict[int, float],
+        node_regions: Dict[int, str],
+    ) -> List[int]:
+        ranking = []
+        for node_id, score in fraud_scores.items():
+            uncertainty = float(uncertainty_scores.get(node_id, 0.0))
+            region = str(node_regions.get(node_id, "unknown"))
+            threshold = self.effective_threshold(node_id=node_id, region=region, uncertainty=uncertainty)
+            margin = float(score) - threshold
+            risk_priority = margin + 0.2 * float(score) - 0.05 * uncertainty
+            ranking.append((risk_priority, int(node_id)))
+        ranking.sort(reverse=True)
+        return [node_id for _, node_id in ranking]
 
     def maybe_retrain(
         self,
@@ -293,7 +350,10 @@ class AdaptiveDefenderPolicy(DefenderPolicy):
     def update_threshold(self, fp_rate: float, fn_rate: float) -> None:
         if not self.dynamic_threshold:
             return
-        self.current_threshold += 0.03 * float(fp_rate - fn_rate)
+        explore = 0.0
+        if self._rng.random() < self.threshold_exploration_rate:
+            explore = float(self._rng.normal(0.0, 0.04))
+        self.current_threshold += 0.03 * float(fp_rate - fn_rate) + explore
         self.current_threshold = float(np.clip(self.current_threshold, 0.2, 0.95))
 
     def timestep_metrics(self, y_true: np.ndarray, y_pred: np.ndarray, threshold: float) -> DefenderStepMetrics:
@@ -307,6 +367,14 @@ class AdaptiveDefenderPolicy(DefenderPolicy):
         fn_rate = float(fn / max(fn + tp, 1))
         attacker_recall = float(tp / max(tp + fn, 1))
         self.performance_vs_adaptive_attackers.append(attacker_recall)
+        utility_reward = float(attacker_recall - 0.6 * fp_rate - 0.4 * fn_rate)
+        arm = float(self._active_threshold_arm)
+        prev_count = int(self._arm_counts.get(arm, 0))
+        prev_mean = float(self._arm_mean_reward.get(arm, 0.0))
+        new_count = prev_count + 1
+        new_mean = prev_mean + (utility_reward - prev_mean) / max(new_count, 1)
+        self._arm_counts[arm] = new_count
+        self._arm_mean_reward[arm] = float(new_mean)
         self.update_threshold(fp_rate=fp_rate, fn_rate=fn_rate)
         return DefenderStepMetrics(
             false_positive_rate=fp_rate,
@@ -329,4 +397,15 @@ def summarize_defender_metrics(policy: AdaptiveDefenderPolicy, current_timestep:
         "avg_reputation_score": avg_rep,
         "quarantined_node_count": quarantined,
         "dynamic_threshold": float(policy.current_threshold),
+        "defender_action_budget_per_step": float(policy.action_budget_per_step),
+        "threshold_exploration_rate": float(policy.threshold_exploration_rate),
     }
+
+
+def tune_threshold(current_threshold: float, false_positive_rate: float, false_negative_rate: float, step: float = 0.03) -> float:
+    updated = float(current_threshold) + float(step) * float(false_positive_rate - false_negative_rate)
+    return float(np.clip(updated, 0.2, 0.95))
+
+
+def balance_fp_fn(false_positive_rate: float, false_negative_rate: float, fp_weight: float = 0.6, fn_weight: float = 0.4) -> float:
+    return float(fp_weight * false_positive_rate + fn_weight * false_negative_rate)

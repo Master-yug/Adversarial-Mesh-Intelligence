@@ -7,8 +7,8 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 
-from constants import AGGREGATION_SUFFIXES, BASE_FEATURE_COLUMNS, FEATURE_COLUMNS, FEATURE_MEANINGS
-from geo import haversine_km
+from utils.constants import AGGREGATION_SUFFIXES, BASE_FEATURE_COLUMNS, FEATURE_COLUMNS, FEATURE_MEANINGS
+from simulation.geo import haversine_km
 from simulation import SimulationResult
 
 Coordinate = Tuple[float, float]
@@ -17,6 +17,14 @@ Coordinate = Tuple[float, float]
 TRUST_DISPERSION_SCALE = 150.0
 TRUST_RECIPROCITY_WEIGHT = 0.65
 TRUST_STABILITY_WEIGHT = 0.35
+MISSING_LATENCY_IMPUTATION_SCALE = 2
+MISSING_RATIO_INCONSISTENCY_PENALTY = 0.12
+ROLLING_WINDOW_SIZE = 5
+PARTIAL_HISTORY_MIN_FRAC = 0.55
+FEATURE_MISSING_BASE_RATE = 0.015
+FEATURE_JITTER_BASE = 0.03
+BASE_PERMANENT_AMBIGUOUS_RATE = 0.35
+PARTIAL_LABEL_AMBIGUOUS_MULTIPLIER = 0.45
 
 
 @dataclass(frozen=True)
@@ -236,6 +244,92 @@ def _compute_temporal_anomaly_features(node_history: pd.DataFrame) -> pd.DataFra
     return history
 
 
+def _inject_feature_uncertainty(
+    temporal_df: pd.DataFrame,
+    simulation: SimulationResult,
+) -> pd.DataFrame:
+    if temporal_df.empty:
+        return temporal_df
+    metrics = simulation.scenario_metrics or {}
+    noise_level = float(np.clip(metrics.get("noise_level", 0.15), 0.0, 1.0))
+    visibility_level = float(np.clip(metrics.get("visibility_level", 0.85), 0.0, 1.0))
+    sophistication = float(np.clip(metrics.get("attacker_sophistication", 0.5), 0.0, 1.0))
+    seed = int(round(float(metrics.get("seed", 42.0))))
+    rng = np.random.default_rng(seed + 7001)
+    out = temporal_df.copy()
+    node_ids = out["node_id"].astype(int).to_numpy(dtype=int)
+    unique_nodes = np.unique(node_ids)
+    latent_global = {
+        int(node_id): float(rng.normal(0.0, 0.08 + 0.16 * noise_level))
+        for node_id in unique_nodes
+    }
+    latent_visibility = {
+        int(node_id): float(rng.normal(0.0, 0.05 + 0.12 * (1.0 - visibility_level)))
+        for node_id in unique_nodes
+    }
+
+    multiplicative_features = {
+        "rtt_variance",
+        "avg_latency_to_peers",
+        "claimed_inferred_distance_mismatch",
+        "peer_geographic_diversity",
+        "latency_inconsistency_score",
+        "max_latency_spike",
+        "behavior_volatility",
+        "sudden_change_score",
+    }
+    bounded_features = {"clustering_coefficient", "reciprocity_score", "neighbor_trust_score", "burst_activity_score"}
+
+    jitter_std = FEATURE_JITTER_BASE + 0.09 * noise_level + 0.03 * sophistication
+    missing_rate = FEATURE_MISSING_BASE_RATE + 0.08 * noise_level + 0.10 * (1.0 - visibility_level)
+    for feature in BASE_FEATURE_COLUMNS:
+        if feature not in out:
+            continue
+        values = pd.to_numeric(out[feature], errors="coerce").to_numpy(dtype=float)
+        base_latent = np.array([latent_global.get(int(node_id), 0.0) for node_id in node_ids], dtype=float)
+        visibility_latent = np.array([latent_visibility.get(int(node_id), 0.0) for node_id in node_ids], dtype=float)
+        correlated_noise = (
+            base_latent
+            + visibility_latent * (0.6 if feature in {"unique_peers", "neighbor_trust_score"} else 0.3)
+            + rng.normal(0.0, jitter_std * 0.35, size=values.size)
+        )
+        if feature in multiplicative_features:
+            distorted = values * (1.0 + rng.normal(0.0, jitter_std, size=values.size) + correlated_noise * 0.15)
+        else:
+            distorted = values + rng.normal(0.0, jitter_std * 0.8, size=values.size) + correlated_noise
+
+        if feature == "claimed_inferred_distance_mismatch":
+            distorted = distorted + rng.normal(0.0, 120.0 + 380.0 * noise_level, size=values.size)
+        if feature == "avg_latency_to_peers":
+            distorted = distorted + rng.normal(0.0, 2.0 + 14.0 * noise_level, size=values.size)
+        if feature == "unique_peers":
+            distorted = distorted + rng.normal(0.0, 0.8 + 2.0 * (1.0 - visibility_level), size=values.size)
+        if feature in bounded_features:
+            distorted = np.clip(distorted, 0.0, 1.0)
+        elif feature == "unique_peers":
+            distorted = np.clip(np.round(distorted), 0.0, None)
+        else:
+            distorted = np.clip(distorted, 0.0, None)
+
+        mask = rng.random(values.size) < missing_rate
+        distorted = distorted.astype(float)
+        distorted[mask] = np.nan
+        out[feature] = distorted
+
+    def _impute_series(series: pd.Series) -> pd.Series:
+        s = pd.to_numeric(series, errors="coerce")
+        filled = s.ffill().bfill()
+        if filled.notna().any():
+            return filled.fillna(float(np.nanmedian(filled.to_numpy(dtype=float))))
+        return filled.fillna(0.0)
+
+    for feature in BASE_FEATURE_COLUMNS:
+        if feature not in out:
+            continue
+        out[feature] = out.groupby("node_id", sort=False)[feature].transform(_impute_series).astype(float)
+    return out
+
+
 def _extract_features_from_graph(
     graph: nx.DiGraph,
     latency_matrix: np.ndarray,
@@ -257,7 +351,17 @@ def _extract_features_from_graph(
 
         peer_latencies = _safe_array([latency_matrix[node_id, p] for p in out_neighbors])
         if peer_latencies.size == 0:
-            peer_latencies = np.array([0.0], dtype=float)
+            inbound_latencies = _safe_array([latency_matrix[p, node_id] for p in in_neighbors])
+            peer_latencies = inbound_latencies if inbound_latencies.size > 0 else np.array([0.0], dtype=float)
+        missing_ratio = 1.0 - float(peer_latencies.size / max(len(all_neighbors), 1))
+        if missing_ratio > 0.0 and peer_latencies.size > 0:
+            peer_latencies = np.append(
+                peer_latencies,
+                np.repeat(
+                    np.nanmedian(peer_latencies),
+                    int(round(missing_ratio * MISSING_LATENCY_IMPUTATION_SCALE)),
+                ),
+            )
 
         inferred_location = _infer_location_from_peers(
             node_id=node_id,
@@ -292,7 +396,8 @@ def _extract_features_from_graph(
                 out_neighbors=out_neighbors,
                 latency_matrix=latency_matrix,
                 claimed_locations=claimed_locations,
-            ),
+            )
+            + MISSING_RATIO_INCONSISTENCY_PENALTY * missing_ratio,
             "neighbor_trust_score": _neighbor_trust_score(
                 node_id=node_id,
                 graph=graph,
@@ -356,7 +461,7 @@ def extract_temporal_node_features(simulation: SimulationResult) -> pd.DataFrame
     for _, node_history in temporal_df.groupby("node_id", sort=False):
         enriched_frames.append(_compute_temporal_anomaly_features(node_history))
     enriched = pd.concat(enriched_frames, ignore_index=True).sort_values(["timestep", "node_id"]).reset_index(drop=True)
-    return enriched
+    return _inject_feature_uncertainty(enriched, simulation=simulation)
 
 
 def build_model_features_from_temporal_frame(temporal_df: pd.DataFrame) -> pd.DataFrame:
@@ -381,16 +486,43 @@ def build_model_features_from_temporal_frame(temporal_df: pd.DataFrame) -> pd.Da
 
 
 def _aggregate_temporal_features(temporal_df: pd.DataFrame) -> pd.DataFrame:
-    aggregate_frames = []
-    for base_feature in BASE_FEATURE_COLUMNS:
-        grouped = temporal_df.groupby("node_id")[base_feature]
-        aggregate_frames.append(grouped.mean().rename(f"{base_feature}_mean"))
-        aggregate_frames.append(grouped.std(ddof=0).fillna(0.0).rename(f"{base_feature}_std"))
-        aggregate_frames.append(grouped.last().rename(f"{base_feature}_last"))
+    rows = []
+    for node_id, node_frame in temporal_df.groupby("node_id", sort=False):
+        ordered = node_frame.sort_values("timestep").reset_index(drop=True)
+        history_len = len(ordered)
+        partial_len = max(2, int(round(history_len * PARTIAL_HISTORY_MIN_FRAC)))
+        recent = ordered.tail(partial_len)
+        sample = recent.tail(min(len(recent), ROLLING_WINDOW_SIZE))
+        weights = np.linspace(0.45, 1.0, num=len(sample), dtype=float)
+        if weights.sum() <= 0:
+            weights = np.ones(len(sample), dtype=float)
+        weights = weights / weights.sum()
 
-    aggregated = pd.concat(aggregate_frames, axis=1).reset_index()
-    label_frame = temporal_df.groupby("node_id")[["label", "label_name"]].last().reset_index()
-    merged = aggregated.merge(label_frame, on="node_id", how="left")
+        out: Dict[str, float] = {"node_id": float(node_id)}
+        for base_feature in BASE_FEATURE_COLUMNS:
+            series = pd.to_numeric(sample[base_feature], errors="coerce").to_numpy(dtype=float)
+            full_series = pd.to_numeric(recent[base_feature], errors="coerce").to_numpy(dtype=float)
+            if series.size == 0:
+                out[f"{base_feature}_mean"] = 0.0
+                out[f"{base_feature}_std"] = 0.0
+                out[f"{base_feature}_last"] = 0.0
+                continue
+            w = weights[-series.size :]
+            w = w / max(np.sum(w), 1e-9)
+            weighted_mean = float(np.nansum(series * w))
+            roll_std = pd.Series(full_series).rolling(window=min(ROLLING_WINDOW_SIZE, len(full_series)), min_periods=2).std(ddof=0)
+            instability = float(np.nanmedian(roll_std.to_numpy(dtype=float))) if roll_std.notna().any() else 0.0
+            recent_trend = float(np.nanmean(series[-2:])) if series.size >= 2 else float(series[-1])
+            out[f"{base_feature}_mean"] = weighted_mean
+            out[f"{base_feature}_std"] = float(max(instability, 0.0))
+            out[f"{base_feature}_last"] = float(max(recent_trend, 0.0) if base_feature != "latency_trend_slope" else recent_trend)
+
+        out["label"] = int(ordered["label"].iloc[-1])
+        out["label_name"] = str(ordered["label_name"].iloc[-1])
+        rows.append(out)
+
+    merged = pd.DataFrame(rows)
+    merged["node_id"] = merged["node_id"].astype(int)
 
     for col in FEATURE_COLUMNS:
         if col not in merged.columns:
@@ -402,6 +534,54 @@ def _aggregate_temporal_features(temporal_df: pd.DataFrame) -> pd.DataFrame:
 def extract_node_features(simulation: SimulationResult) -> pd.DataFrame:
     temporal_df = extract_temporal_node_features(simulation)
     aggregated_df = _aggregate_temporal_features(temporal_df)
+    metrics = simulation.scenario_metrics or {}
+    label_noise_rate = float(np.clip(metrics.get("label_noise_rate", 0.0), 0.0, 0.25))
+    partial_label_rate = float(np.clip(metrics.get("partial_label_rate", 0.0), 0.0, 0.75))
+    delayed_label_steps = int(max(0, round(float(metrics.get("delayed_label_steps", 0.0)))))
+    seed = int(round(float(metrics.get("seed", 42.0))))
+    rng = np.random.default_rng(seed + 9103)
+    if label_noise_rate > 0.0 and not aggregated_df.empty:
+        flip_mask = rng.random(len(aggregated_df)) < label_noise_rate
+        if flip_mask.any():
+            aggregated_df.loc[flip_mask, "label"] = 1 - aggregated_df.loc[flip_mask, "label"].astype(int)
+            aggregated_df.loc[flip_mask, "label_name"] = aggregated_df.loc[flip_mask, "label"].map(
+                {0: "honest", 1: "ambiguous_or_attacker"}
+            )
+        inconsistency = (
+            pd.to_numeric(aggregated_df["latency_inconsistency_score_mean"], errors="coerce").fillna(0.0)
+            if "latency_inconsistency_score_mean" in aggregated_df
+            else pd.Series(np.zeros(len(aggregated_df), dtype=float), index=aggregated_df.index)
+        )
+        borderline_attackers = (
+            (aggregated_df["label"].astype(int) == 1)
+            & (inconsistency < 0.25)
+            & (rng.random(len(aggregated_df)) < (label_noise_rate * 0.8))
+        )
+        if borderline_attackers.any():
+            aggregated_df.loc[borderline_attackers, "label"] = 0
+            aggregated_df.loc[borderline_attackers, "label_name"] = "delayed_detection"
+    if not aggregated_df.empty:
+        node_info = {int(node.node_id): node for node in simulation.nodes}
+        aggregated_df["is_ambiguous"] = aggregated_df["node_id"].map(
+            lambda node_id: bool(getattr(node_info.get(int(node_id)), "ambiguity_anchor", False))
+        )
+        aggregated_df["label_observed_delay"] = aggregated_df["node_id"].map(
+            lambda _: int(rng.integers(0, max(delayed_label_steps, 1) + 1)) if delayed_label_steps > 0 else 0
+        )
+        unlabeled_mask = rng.random(len(aggregated_df)) < partial_label_rate
+        permanent_ambiguous_mask = aggregated_df["is_ambiguous"] & (
+            rng.random(len(aggregated_df))
+            < (BASE_PERMANENT_AMBIGUOUS_RATE + PARTIAL_LABEL_AMBIGUOUS_MULTIPLIER * partial_label_rate)
+        )
+        unlabeled_mask = unlabeled_mask | permanent_ambiguous_mask.to_numpy(dtype=bool)
+        aggregated_df["is_labeled"] = (~unlabeled_mask).astype(int)
+        aggregated_df["effective_label"] = aggregated_df["label"].astype(int)
+        aggregated_df.loc[aggregated_df["is_labeled"] == 0, "effective_label"] = -1
+    else:
+        aggregated_df["is_ambiguous"] = pd.Series(dtype=bool)
+        aggregated_df["label_observed_delay"] = pd.Series(dtype=int)
+        aggregated_df["is_labeled"] = pd.Series(dtype=int)
+        aggregated_df["effective_label"] = pd.Series(dtype=int)
     numeric_cols = [c for c in aggregated_df.columns if c not in {"node_id", "label_name"}]
     aggregated_df[numeric_cols] = aggregated_df[numeric_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
     return aggregated_df

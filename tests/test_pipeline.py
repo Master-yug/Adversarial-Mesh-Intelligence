@@ -6,7 +6,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from api import ScoreNodeRequest, _build_feature_vector, app
-from constants import FEATURE_COLUMNS
+from utils.constants import FEATURE_COLUMNS
 from features import extract_node_features, extract_temporal_node_features
 from modeling import train_fraud_model
 from simulation import build_network_simulation
@@ -102,6 +102,7 @@ class AntiSpoofPipelineTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 200)
                 data = response.json()
                 self.assertIn("fraud_score", data)
+                self.assertIn("uncertainty", data)
                 self.assertIn("uncertainty_score", data)
                 self.assertIn("risk_label", data)
                 self.assertIn("trend", data)
@@ -112,6 +113,7 @@ class AntiSpoofPipelineTests(unittest.TestCase):
                 self.assertLessEqual(float(data["confidence_score"]), 1.0)
                 self.assertGreaterEqual(float(data["uncertainty_score"]), 0.0)
                 self.assertLessEqual(float(data["uncertainty_score"]), 1.0)
+                self.assertAlmostEqual(float(data["uncertainty"]), float(data["uncertainty_score"]), places=7)
                 baseline_score = float(data["fraud_score"])
 
                 increasing_payload = dict(payload)

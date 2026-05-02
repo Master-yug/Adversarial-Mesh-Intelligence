@@ -40,6 +40,8 @@ def simulate_economic_rewards(
     attacker_reward_detected: float = 0.35,
     naive_reward_multiplier: float = 1.0,
     smart_reward_multiplier: float = 1.15,
+    residual_leak_floor: float = 0.18,
+    defense_fatigue: float = 0.28,
 ) -> EconomicSimulationResult:
     timestep_count = len(fraud_scores_over_time)
     node_regions = node_regions or {node_id: "unknown" for node_id in node_labels}
@@ -79,7 +81,11 @@ def simulate_economic_rewards(
                     attacker_base *= naive_reward_multiplier
                 attacker_base *= dynamic_multiplier
                 attacker_reward_without_detection += attacker_base
-                reward = attacker_reward_detected * dynamic_multiplier if detected else attacker_base
+                fatigue_ratio = timestep / max(timestep_count - 1, 1)
+                effective_detected_reward = (
+                    attacker_reward_detected + residual_leak_floor + defense_fatigue * fatigue_ratio
+                ) * dynamic_multiplier
+                reward = effective_detected_reward if detected else attacker_base
                 if region in high_value_regions_set:
                     attack_attempts_high_value += 1
                     if not detected:
