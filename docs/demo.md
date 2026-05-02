@@ -1,4 +1,4 @@
-# 🎬 Demo Guide — Adversarial-Mesh-Intelligence
+#  Demo Guide — Adversarial-Mesh-Intelligence
 
 ## Before You Start
 

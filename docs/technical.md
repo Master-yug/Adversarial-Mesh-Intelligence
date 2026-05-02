@@ -1,4 +1,4 @@
-# 🔬 Technical Overview — Adversarial-Mesh-Intelligence
+#  Technical Overview — Adversarial-Mesh-Intelligence
 
 ## 1. Attacker Strategy Learning
 
