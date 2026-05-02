@@ -1,4 +1,4 @@
-#  Adversarial-Mesh-Intelligence
+# Adversarial-Mesh-Intelligence
 
  **The first game-theoretic fraud detection engine built for decentralized networks — where attackers learn, defenders adapt, and the system finds its own equilibrium.**
 
