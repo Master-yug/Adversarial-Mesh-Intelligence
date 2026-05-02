@@ -1,10 +1,10 @@
-# 🧠 Adversarial-Mesh-Intelligence
+#  Adversarial-Mesh-Intelligence
 
-> **The first game-theoretic fraud detection engine built for decentralized networks — where attackers learn, defenders adapt, and the system finds its own equilibrium.**
+ **The first game-theoretic fraud detection engine built for decentralized networks — where attackers learn, defenders adapt, and the system finds its own equilibrium.**
 
 ---
 
-## 🚨 The Problem
+##  The Problem
 
 Decentralized networks — GPS-reward systems, DePIN infrastructure, Web3 peer networks — are under attack.
 
@@ -20,23 +20,23 @@ The result? Millions in fraud losses, degraded network quality, and honest parti
 
 ---
 
-## 💡 The Solution
+##  The Solution
 
 **Adversarial-Mesh-Intelligence** is a closed-loop adversarial simulation engine that treats fraud detection as a **strategic game** — not a static filter.
 
 Two intelligent agents compete in real time:
 
-- 🔴 **The Attacker Agent** — learns which fraud strategies succeed, adapts its mix every round, and simulates what the defender will do *before* it acts
-- 🔵 **The Defender Agent** — optimizes its detection threshold and investigation budget, adjusting after every round based on cost signals
+-  **The Attacker Agent** — learns which fraud strategies succeed, adapts its mix every round, and simulates what the defender will do *before* it acts
+-  **The Defender Agent** — optimizes its detection threshold and investigation budget, adjusting after every round based on cost signals
 
 The system runs, learns, and evolves until it reaches **equilibrium** — the point where neither side can gain by changing strategy. That stable state tells you *exactly* how resilient your network is.
 
 **Why this is different:**
-> Most fraud detectors are trained once and deployed. Ours keeps learning. It simulates how attackers evolve, and builds a defender that evolves with them.
+ Most fraud detectors are trained once and deployed. Ours keeps learning. It simulates how attackers evolve, and builds a defender that evolves with them.
 
 ---
 
-## ⚙️ How It Works
+##  How It Works
 
 ```
 1. Simulate Network
@@ -70,7 +70,7 @@ The system runs, learns, and evolves until it reaches **equilibrium** — the po
 
 ---
 
-## 🧠 Key Innovations
+##  Key Innovations
 
 | Innovation | What It Means |
 |---|---|
@@ -85,7 +85,7 @@ The system runs, learns, and evolves until it reaches **equilibrium** — the po
 
 ---
 
-## 📊 Results & Impact
+##  Results & Impact
 
 Running the system across adversarial scenarios reveals consistent behavior:
 
@@ -100,7 +100,7 @@ In benchmark runs:
 
 ---
 
-## 🧪 Demo Instructions
+##  Demo Instructions
 
 ### Install dependencies
 
@@ -153,7 +153,7 @@ uvicorn api:app --host 0.0.0.0 --port 8000
 
 ---
 
-## 📂 Project Structure
+##  Project Structure
 
 ```
 adversarial-mesh-intelligence/
@@ -200,7 +200,7 @@ adversarial-mesh-intelligence/
 
 ---
 
-## 🚀 Future Work
+##  Future Work
 
 - **Real-world data integration** — connect to live DePIN network telemetry feeds
 - **On-chain deployment** — emit fraud scores directly to smart contracts
@@ -210,7 +210,7 @@ adversarial-mesh-intelligence/
 
 ---
 
-## 📎 Quick Reference
+##  Quick Reference
 
 | Command | What it does |
 |---|---|

@@ -1,4 +1,4 @@
-# 🏗️ System Architecture — Adversarial-Mesh-Intelligence
+#  System Architecture — Adversarial-Mesh-Intelligence
 
 ## Overview
 
